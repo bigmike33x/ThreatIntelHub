@@ -1,4 +1,4 @@
-# onionsearch
+# Dark-Crawler
 
 A research-oriented dark web crawler and live dashboard for discovering and categorizing `.onion` sites on the Tor network. Built with Scrapy, Python, and a browser-based UI with real-time updates.
 
@@ -41,8 +41,8 @@ This tool is intended **strictly for security research, academic study, and jour
 
 **1. Clone the repo**
 ```cmd
-git clone https://github.com/yourusername/onionsearch.git
-cd onionsearch
+git clone https://github.com/yourusername/Dark-Crawler.git
+cd Dark-Crawler
 ```
 
 **2. Create a virtual environment**
@@ -88,7 +88,7 @@ From there you can start and stop crawls, search results live, and browse by cat
 ## Project Structure
 
 ```
-onionsearch/
+Dark-Crawler/
 ├── darkweb_crawler/
 │   ├── spiders/
 │   │   └── onion_spider.py   ← crawler logic, seed sources, content filters
