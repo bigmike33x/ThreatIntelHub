@@ -1,8 +1,4 @@
-<<<<<<< Updated upstream
-# Dark-Crawler
-=======
 ![Dark Crawler](assets/banner.svg)
->>>>>>> Stashed changes
 
 A research-oriented dark web crawler and live dashboard for discovering and categorizing `.onion` sites on the Tor network. Built with Scrapy, Python, and a browser-based UI with real-time updates.
 
