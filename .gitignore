@@ -1,0 +1,25 @@
+# Crawl results — never commit these
+results.jsonl
+organized_results.json
+onion_dashboard.html
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Scrapy
+crawl_state/
+.scrapy/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
