@@ -89,10 +89,8 @@ Dark-Crawler/
 │   ├── items.py               ← data model
 │   └── settings.py            ← Scrapy config
 ├── server.py                  ← local web server + dashboard UI
-├── organizer.py               ← offline JSON organizer (optional)
 ├── scrapy.cfg
 ├── requirements.txt
-├── .gitignore
 └── README.md
 ```
 
