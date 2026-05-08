@@ -45,19 +45,12 @@ git clone https://github.com/yourusername/Dark-Crawler.git
 cd Dark-Crawler
 ```
 
-**2. Create a virtual environment**
-```cmd
-python -m venv venv
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # macOS / Linux
-```
-
-**3. Install dependencies**
+**2. Install dependencies**
 ```cmd
 pip install -r requirements.txt
 ```
 
-**4. Start Tor**
+**3. Start Tor**
 
 | Method | Port |
 |---|---|
