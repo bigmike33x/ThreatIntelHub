@@ -132,8 +132,6 @@ Results are saved to `results.jsonl` (one JSON object per line):
 {"url": "http://example.onion/", "title": "Example", "status": 200, "body_preview": "...", "timestamp": 1234567890}
 ```
 
-This file is excluded from the repository via `.gitignore`. Do not share it publicly.
-
 ---
 
 ## Categories
