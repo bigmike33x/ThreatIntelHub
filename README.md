@@ -1,4 +1,8 @@
+<<<<<<< Updated upstream
 # Dark-Crawler
+=======
+![Dark Crawler](assets/banner.svg)
+>>>>>>> Stashed changes
 
 A research-oriented dark web crawler and live dashboard for discovering and categorizing `.onion` sites on the Tor network. Built with Scrapy, Python, and a browser-based UI with real-time updates.
 
@@ -107,12 +111,20 @@ Dark-Crawler/
 
 ## How It Works
 
+![Architecture](assets/diagram.svg)
+
 1. **Seeding** — queries Ahmia and DarkSearch for dozens of search terms, harvesting `.onion` addresses from results
 2. **Crawling** — visits each unique `.onion` homepage via Tor, saves title and text preview
 3. **Discovery** — scans each page for new `.onion` addresses in links and raw text, queues them
 4. **Filtering** — skips dead sites (non-200), empty pages, and adult content
 5. **Deduplication** — tracks every visited hostname; previously crawled sites from `results.jsonl` are skipped on subsequent runs
 6. **Categorization** — keyword matching assigns each site to one of 14 categories
+
+---
+
+## Dashboard
+
+![Dashboard](assets/screenshot.svg)
 
 ---
 
