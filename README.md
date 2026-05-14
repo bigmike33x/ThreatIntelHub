@@ -18,14 +18,27 @@ This tool is intended **strictly for security research, academic study, and jour
 
 ## Features
 
+### Crawler
 - 🔍 Seeds from multiple sources — Ahmia index, Ahmia search, DarkSearch API
 - 🧅 Discovers new `.onion` sites by following links and scanning page text
-- 🚫 Filters out adult content and dead/empty pages automatically
-- 💾 Deduplicates results — already-crawled sites are never visited twice
-- 📊 Live browser dashboard — no command line needed after setup
-- ⚡ Real-time updates every 2 seconds while crawling
-- 🗂️ Auto-categorizes sites into 14 categories
-- 🔎 Full-text search across all categories simultaneously
+- 🚫 Filters at crawl time — noise never reaches the database
+  - Adult content
+  - Scam shops (gift cards, CVV, clone cards, cashgod, etc.)
+  - Dead pages (seized, DDoS redirects, "please wait" queues)
+  - Noise titles (403, 404, nginx defaults, "under construction")
+  - Thin pages (less than 80 characters of body text)
+- 💾 Deduplicates by hostname — already-crawled sites are never visited twice
+
+### Dashboard
+- ⭐ **Top Picks** — highest scored sites surfaced automatically based on content quality
+- 🔍 **Browse** — full table view with search, sort, and category filtering
+- 🔖 **Bookmarks** — save sites to come back to
+- 🗑 **Filtered Out** — noise/scam sites hidden but not deleted
+- 📋 **Detail drawer** — click any site for full preview and personal notes
+- 📊 **Score system** — every site scored by content richness, keywords, and category
+- ⚡ **Live updates** — new sites stream in every 3 seconds while crawling
+- 🗃 **SQLite backend** — fast full-text search across all 14 categories
+- 🖥 **No command line needed** — start and stop crawls from the browser
 
 ---
 
@@ -45,19 +58,12 @@ git clone https://github.com/yourusername/Dark-Crawler.git
 cd Dark-Crawler
 ```
 
-**2. Create a virtual environment**
-```cmd
-python -m venv venv
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # macOS / Linux
-```
-
-**3. Install dependencies**
+**2. Install dependencies**
 ```cmd
 pip install -r requirements.txt
 ```
 
-**4. Start Tor**
+**3. Start Tor**
 
 | Method | Port |
 |---|---|

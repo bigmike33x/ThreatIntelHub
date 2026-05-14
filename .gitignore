@@ -2,6 +2,8 @@
 results.jsonl
 organized_results.json
 onion_dashboard.html
+crawler.db
+migrate_to_db.py
 
 # Python
 venv/
