@@ -151,7 +151,7 @@ print('Done:', {k: len(v) for k, v in seeds.items()})
 
 **5. Start the server**
 ```bash
-python server_v2.py
+python server.py
 ```
 
 Open your browser to `http://localhost:8765`, or from another device on the same network: `http://[pi-ip]:8765`
@@ -191,7 +191,7 @@ crontab -e
 
 Add:
 ```
-@reboot cd /home/pi/dark-crawler && /home/pi/dark-crawler/venv/bin/python server_v2.py &
+@reboot cd /home/pi/dark-crawler && /home/pi/dark-crawler/venv/bin/python server.py &
 @reboot cd /home/pi/dark-crawler && TG_API_ID=your_id TG_API_HASH=your_hash /home/pi/dark-crawler/venv/bin/python telegram_monitor.py >> telegram.log 2>&1 &
 ```
 
@@ -207,7 +207,7 @@ dark-crawler/
 │   ├── middlewares.py            ← Tor SOCKS5 proxy (.onion only, no clearnet)
 │   ├── items.py                  ← data models (OnionPageItem, LeakItem)
 │   └── settings.py              ← Scrapy config
-├── server_v2.py                  ← web server + live dashboard (12 tabs)
+├── server.py                  ← web server + live dashboard (12 tabs)
 ├── telegram_monitor.py           ← Telegram channel monitor + snowball discovery
 ├── migrate_to_db.py              ← convert existing results.jsonl → crawler.db
 ├── assets/
