@@ -25,3 +25,7 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Scrapy job resume state
+crawl_job/
+.crawler_state.json
