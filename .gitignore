@@ -1,9 +1,23 @@
-# Crawl results — never commit these
+# Crawl data and generated output — never commit
 results.jsonl
+leaks.jsonl
 organized_results.json
 onion_dashboard.html
 crawler.db
+
+# Generated files
+cti_seeds.json
 migrate_to_db.py
+
+# Telegram sessions and private state
+tg_session.session
+*.session
+
+# Scrapy state and resume data
+crawl_job/
+crawl_state/
+.scrapy/
+.crawler_state.json
 
 # Python
 venv/
@@ -13,19 +27,15 @@ __pycache__/
 *.pyd
 .Python
 
-# Scrapy
-crawl_state/
-.scrapy/
+# Logs
+telegram.log
+*.log
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
-# Editor
+# Editor / IDE
 .vscode/
 .idea/
 *.swp
-
-# Scrapy job resume state
-crawl_job/
-.crawler_state.json
