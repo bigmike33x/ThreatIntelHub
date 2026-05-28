@@ -919,6 +919,121 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con.close()
             self.send_json({"results":[dict(r) for r in rows],"total":len(rows)})
 
+        elif p.path == "/api/intel/search":
+            term = g("term","").strip()
+            if not term or len(term)<3:
+                self.send_json({"term":term,"total":0,"exposures":[],"leaks":[],"telegram":[]}); return
+            like = f"%{term}%"
+            con = db()
+            try:
+                exposures = []
+                if table_exists(con, "exposure_entities"):
+                    cols = {r[1] for r in con.execute("PRAGMA table_info(exposure_entities)").fetchall()}
+                    value_col = "value_plain" if "value_plain" in cols else ("value" if "value" in cols else None)
+                    type_col = "entity_type" if "entity_type" in cols else ("type" if "type" in cols else None)
+                    times_col = "times_seen" if "times_seen" in cols else None
+                    if value_col:
+                        select_cols = [f"{value_col} AS value"]
+                        select_cols.append(f"{type_col} AS entity_type" if type_col else "'unknown' AS entity_type")
+                        select_cols.append(f"{times_col} AS times_seen" if times_col else "1 AS times_seen")
+                        if "id" in cols:
+                            select_cols.append("id")
+                        rows = con.execute(
+                            f"SELECT {', '.join(select_cols)} FROM exposure_entities WHERE {value_col} LIKE ? ORDER BY times_seen DESC LIMIT 100",
+                            (like,)
+                        ).fetchall()
+                        exposures = [dict(r) for r in rows]
+
+                leaks = []
+                if table_exists(con, "leaks"):
+                    leaks = [dict(r) for r in con.execute(
+                        "SELECT id,url,title,confidence,has_emails,has_hashes,has_ssn,has_magnet,timestamp "
+                        "FROM leaks WHERE title LIKE ? OR url LIKE ? OR full_text LIKE ? "
+                        "ORDER BY confidence DESC LIMIT 50",
+                        (like, like, like)
+                    ).fetchall()]
+
+                telegram = []
+                if table_exists(con, "telegram_messages"):
+                    telegram = [dict(r) for r in con.execute(
+                        "SELECT id,channel_name,message_id,text,timestamp,confidence,has_leak "
+                        "FROM telegram_messages WHERE text LIKE ? OR channel_name LIKE ? "
+                        "ORDER BY timestamp DESC LIMIT 50",
+                        (like, like)
+                    ).fetchall()]
+
+                self.send_json({
+                    "term": term,
+                    "total": len(exposures) + len(leaks) + len(telegram),
+                    "exposures": exposures,
+                    "leaks": leaks,
+                    "telegram": telegram
+                })
+            except Exception as e:
+                self.send_json({"term":term,"total":0,"exposures":[],"leaks":[],"telegram":[],"error":str(e)}, 500)
+            finally:
+                con.close()
+
+        elif p.path == "/api/search/context":
+            q = g("q","").strip()
+            max_rows = int(g("max","20") or 20)
+            if not q or len(q)<2:
+                self.send_json({"results":[],"total":0}); return
+            like = f"%{q}%"
+            qlow = q.lower()
+            results = []
+            def make_snippet(txt):
+                txt = txt or ""
+                low = txt.lower()
+                idx = low.find(qlow)
+                if idx < 0:
+                    return txt[:240], -1, -1
+                start = max(0, idx - 90)
+                end = min(len(txt), idx + len(q) + 150)
+                return txt[start:end], idx - start, idx - start + len(q)
+            con = db()
+            try:
+                if table_exists(con, "leaks"):
+                    for r in con.execute(
+                        "SELECT id,url,title,full_text,confidence FROM leaks "
+                        "WHERE title LIKE ? OR url LIKE ? OR full_text LIKE ? "
+                        "ORDER BY confidence DESC LIMIT ?",
+                        (like, like, like, max_rows)
+                    ).fetchall():
+                        sn, s, e = make_snippet(r["full_text"] or r["title"] or "")
+                        results.append({"source":"leaks","id":r["id"],"title":r["title"],"url":r["url"],"snippet":sn,"kw_start":s,"kw_end":e,"confidence":r["confidence"]})
+
+                if table_exists(con, "telegram_messages") and len(results) < max_rows:
+                    for r in con.execute(
+                        "SELECT id,channel_name,message_id,text,timestamp,confidence FROM telegram_messages "
+                        "WHERE text LIKE ? OR channel_name LIKE ? ORDER BY timestamp DESC LIMIT ?",
+                        (like, like, max_rows - len(results))
+                    ).fetchall():
+                        sn, s, e = make_snippet(r["text"] or "")
+                        title = f"Telegram: {r['channel_name'] or 'unknown'} #{r['message_id'] or ''}"
+                        results.append({"source":"telegram","id":r["id"],"title":title,"url":"","snippet":sn,"kw_start":s,"kw_end":e,"confidence":r["confidence"]})
+
+                if table_exists(con, "exposure_entities") and len(results) < max_rows:
+                    cols = {rr[1] for rr in con.execute("PRAGMA table_info(exposure_entities)").fetchall()}
+                    value_col = "value_plain" if "value_plain" in cols else ("value" if "value" in cols else None)
+                    type_col = "entity_type" if "entity_type" in cols else ("type" if "type" in cols else None)
+                    times_col = "times_seen" if "times_seen" in cols else None
+                    if value_col:
+                        select_cols = [f"{value_col} AS value"]
+                        select_cols.append(f"{type_col} AS entity_type" if type_col else "'unknown' AS entity_type")
+                        select_cols.append(f"{times_col} AS times_seen" if times_col else "1 AS times_seen")
+                        for r in con.execute(
+                            f"SELECT {', '.join(select_cols)} FROM exposure_entities WHERE {value_col} LIKE ? ORDER BY times_seen DESC LIMIT ?",
+                            (like, max_rows - len(results))
+                        ).fetchall():
+                            sn, s, e = make_snippet(r["value"] or "")
+                            results.append({"source":"archive","id":None,"title":f"Imported dump entity: {r['entity_type']}","url":"","snippet":sn,"kw_start":s,"kw_end":e,"times_seen":r["times_seen"]})
+                self.send_json({"results":results[:max_rows],"total":len(results)})
+            except Exception as e:
+                self.send_json({"results":[],"total":0,"error":str(e)}, 500)
+            finally:
+                con.close()
+
         elif p.path == "/api/alerts":
             con  = db()
             rows = con.execute('''
@@ -2945,7 +3060,7 @@ body::after {
   <nav class="nav">
     <div class="nav-section-label">Intelligence</div>
     <div class="nav-item" onclick="setTab('leaks')"     id="tab-leaks" class="nav-item active">
-      <span class="nav-icon">&#128274;</span> Leaks & Exploits
+      <span class="nav-icon">&#128269;</span> Intel Search
     </div>
     <div class="nav-item" onclick="setTab('telegram')"  id="tab-telegram">
       <span class="nav-icon">&#128241;</span> Telegram
@@ -2987,46 +3102,48 @@ body::after {
 
     <!-- LEAKS -->
     <div class="panel active" id="leaksPanel">
-      <div class="content-header">
-        <div class="content-title">Leaks & Exploits</div>
-        <div class="search-bar">
-          <input type="text" id="leakQ" placeholder="Search CVEs, targets, domains…" oninput="loadLeaks()">
+      <!-- Mode tab bar -->
+      <div style="display:flex;align-items:center;gap:0;border-bottom:1px solid var(--border);flex-shrink:0;padding:0 16px;background:var(--bg-2);">
+        <div class="content-title" style="margin-right:20px;white-space:nowrap;font-size:13px;">Intel Search</div>
+        <button class="filter-btn tg-sub-tab on" id="isMode-leaks"   onclick="setIntelSearchMode('leaks')"   style="border-radius:0;margin:0;">&#128270; Leaks</button>
+        <button class="filter-btn tg-sub-tab"    id="isMode-dump"    onclick="setIntelSearchMode('dump')"    style="border-radius:0;margin:0;">&#9888; Dump Search</button>
+        <button class="filter-btn tg-sub-tab"    id="isMode-context" onclick="setIntelSearchMode('context')" style="border-radius:0;margin:0;">&#128203; Context</button>
+      </div>
+      <!-- Leaks search bar (default) -->
+      <div id="isBar-leaks" style="display:flex;align-items:center;gap:8px;padding:8px 16px;border-bottom:1px solid var(--border);flex-shrink:0;">
+        <div class="search-bar" style="flex:1;">
+          <input type="text" id="leakQ" placeholder="Search Telegram intel, CVEs, targets, domains…" oninput="loadLeaks()">
         </div>
         <select class="select" id="leakSort" onchange="loadLeaks()">
           <option value="confidence">Highest confidence</option>
           <option value="newest">Newest</option>
         </select>
-        <div class="filter-row">
-          <button class="filter-btn" id="fEmails"  onclick="toggleLeakFilter('emails')">📧 Emails</button>
-          <button class="filter-btn" id="fHashes"  onclick="toggleLeakFilter('hashes')">🔑 Hashes</button>
-          <button class="filter-btn" id="fCve"     onclick="toggleLeakFilter('cve')">🐛 CVE</button>
-          <button class="filter-btn" id="fMagnet"  onclick="toggleLeakFilter('magnet')">💾 Files</button>
-          <button class="filter-btn" id="fSsn"     onclick="toggleLeakFilter('ssn')">🪪 SSN</button>
-        </div>
+        <button class="filter-btn" id="fEmails"  onclick="toggleLeakFilter('emails')">📧 Emails</button>
+        <button class="filter-btn" id="fHashes"  onclick="toggleLeakFilter('hashes')">🔑 Hashes</button>
+        <button class="filter-btn" id="fCve"     onclick="toggleLeakFilter('cve')">🐛 CVE</button>
+        <button class="filter-btn" id="fMagnet"  onclick="toggleLeakFilter('magnet')">💾 Files</button>
+        <button class="filter-btn" id="fSsn"     onclick="toggleLeakFilter('ssn')">🪪 SSN</button>
         <div class="result-count"><span id="leakShown">—</span> / <span id="leakTotal">—</span></div>
       </div>
-      <!-- Personal search -->
-      <div style="padding:10px 20px;border-bottom:1px solid var(--border);background:rgba(239,68,68,0.04);flex-shrink:0;">
-        <div style="font-size:11px;font-weight:600;color:var(--red);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;">⚠ Personal Data Search</div>
-        <div style="display:flex;gap:8px;">
-          <div class="search-bar" style="max-width:320px;flex:1;">
-            <input type="text" id="personalSearch" placeholder="email, username, SSN…">
-          </div>
-          <button class="btn danger" onclick="searchPersonal()">Search All Leaks</button>
+      <!-- Dump search bar (hidden by default) -->
+      <div id="isBar-dump" style="display:none;align-items:center;gap:8px;padding:8px 16px;border-bottom:1px solid var(--border);background:rgba(239,68,68,0.04);flex-shrink:0;">
+        <span style="font-size:11px;color:var(--red);font-weight:600;white-space:nowrap;letter-spacing:.05em;">⚠ IMPORTED DUMPS</span>
+        <div class="search-bar" style="flex:1;">
+          <input type="text" id="personalSearch" placeholder="email, username, SSN, phone, domain…" onkeydown="if(event.key==='Enter')searchPersonal()">
         </div>
-        <div id="personalResults" style="margin-top:8px;font-size:12px;"></div>
+        <button class="btn danger" onclick="searchPersonal()">Search Imported Data</button>
       </div>
-      <!-- Context search -->
-      <div style="padding:10px 20px;border-bottom:1px solid var(--border);background:rgba(59,130,246,0.03);flex-shrink:0;">
-        <div style="font-size:11px;font-weight:600;color:var(--accent-hi);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;">Keyword Context Search</div>
-        <div style="display:flex;gap:8px;">
-          <div class="search-bar" style="max-width:320px;flex:1;">
-            <input type="text" id="contextQ" placeholder="company, CVE, username…" onkeydown="if(event.key==='Enter')searchContext()">
-          </div>
-          <button class="btn" style="border-color:var(--accent);color:var(--accent-hi);" onclick="searchContext()">Search with Context</button>
+      <!-- Context search bar (hidden by default) -->
+      <div id="isBar-context" style="display:none;align-items:center;gap:8px;padding:8px 16px;border-bottom:1px solid var(--border);background:rgba(59,130,246,0.03);flex-shrink:0;">
+        <span style="font-size:11px;color:var(--accent-hi);font-weight:600;white-space:nowrap;letter-spacing:.05em;">CONTEXT</span>
+        <div class="search-bar" style="flex:1;">
+          <input type="text" id="contextQ" placeholder="company, CVE, username, archive keyword…" onkeydown="if(event.key==='Enter')searchContext()">
         </div>
-        <div id="contextResults" style="margin-top:8px;max-height:180px;overflow-y:auto;"></div>
+        <button class="btn" style="border-color:var(--accent);color:var(--accent-hi);" onclick="searchContext()">Search with Context</button>
       </div>
+      <!-- Inline results panels for dump + context (hidden when not active) -->
+      <div id="isResults-dump"    style="display:none;padding:10px 20px;max-height:260px;overflow-y:auto;flex-shrink:0;border-bottom:1px solid var(--border);font-size:12px;"></div>
+      <div id="isResults-context" style="display:none;padding:10px 20px;max-height:260px;overflow-y:auto;flex-shrink:0;border-bottom:1px solid var(--border);"></div>
       <div class="panel-scroll" style="padding:0;" id="leakTableWrap"></div>
       <div id="leakPgEl"></div>
     </div>
@@ -3387,6 +3504,28 @@ let pollTimer=null, drawerSite=null, searchTimer=null;
 let groupByHost=true, expandedHosts=new Set();
 let leakPage=1, leakTotal=0, leakFilters=new Set();
 const PER_PAGE=50;
+
+// ── Intel Search mode switcher ────────────────────────────────────────────────
+let _intelSearchMode = 'leaks';
+function setIntelSearchMode(mode){
+  _intelSearchMode = mode;
+  ['leaks','dump','context'].forEach(m=>{
+    const btn = document.getElementById('isMode-'+m);
+    const bar = document.getElementById('isBar-'+m);
+    const res = document.getElementById('isResults-'+m);
+    if(btn){ btn.classList.toggle('on', m===mode); }
+    if(bar){ bar.style.display = m===mode ? 'flex' : 'none'; }
+    if(res){ res.style.display = 'none'; } // reset results on mode switch
+  });
+  // show/hide the leaks table
+  const leakWrap = document.getElementById('leakTableWrap');
+  const leakPg   = document.getElementById('leakPgEl');
+  if(leakWrap) leakWrap.style.display = mode==='leaks' ? '' : 'none';
+  if(leakPg)   leakPg.style.display   = mode==='leaks' ? '' : 'none';
+  if(mode==='leaks'){ leakPage=1; loadLeaks(); }
+  else if(mode==='dump')    document.getElementById('personalSearch')?.focus();
+  else if(mode==='context') document.getElementById('contextQ')?.focus();
+}
 const _siteCache={}, _leakCache={};
 
 // Tab data cache — avoid re-fetching unchanged data
@@ -3775,19 +3914,32 @@ async function toggleLeakBm(id,btn){
 async function searchPersonal(){
   const term=document.getElementById('personalSearch').value.trim();
   if(!term||term.length<3)return;
-  const el=document.getElementById('personalResults');
-  el.innerHTML='<span style="color:var(--accent)">Searching…</span>';
-  const res=await fetch(`/api/leaks/search?term=${encodeURIComponent(term)}`).then(r=>r.json()).catch(()=>null);
+  const el=document.getElementById('isResults-dump');
+  el.style.display='block';
+  el.innerHTML='<span style="color:var(--accent)">Searching imported dumps, leaks, and Telegram…</span>';
+  const res=await fetch(`/api/intel/search?term=${encodeURIComponent(term)}`).then(r=>r.json()).catch(()=>null);
   if(!res){el.innerHTML='Search failed.';return;}
-  if(!res.results.length){
+  if(!res.total){
     el.innerHTML=`<span style="color:var(--accent)">✓ No matches found for "${esc(term)}"</span>`;return;
   }
-  el.innerHTML=`<span style="color:var(--danger)">⚠ Found in ${res.results.length} leak(s):</span><br>`+
-    res.results.map(r=>`<div style="margin-top:4px;padding:4px 8px;border-left:2px solid var(--danger);">
-      <span style="color:var(--text)">${esc(r.title||'')}</span>
-      <span style="color:var(--dim);margin-left:8px;font-family:Share Tech Mono,monospace;font-size:.65rem;">${esc(r.url||'')}</span>
-      <span style="color:var(--warn);margin-left:8px;">confidence: ${r.confidence}%</span>
+  const exposureRows=(res.exposures||[]).slice(0,25).map(r=>`<div style="margin-top:4px;padding:4px 8px;border-left:2px solid var(--red);">
+      <span style="color:var(--text)">${esc(r.value||'')}</span>
+      <span class="chip chip-red">${esc(r.entity_type||'entity')}</span>
+      <span style="color:var(--text-3);margin-left:8px;">seen ${(r.times_seen||1).toLocaleString()}x</span>
     </div>`).join('');
+  const leakRows=(res.leaks||[]).slice(0,10).map(r=>`<div style="margin-top:4px;padding:4px 8px;border-left:2px solid var(--amber);">
+      <span style="color:var(--text)">${esc(r.title||'')}</span>
+      <span style="color:var(--text-3);margin-left:8px;font-family:JetBrains Mono,monospace;font-size:11px;">${esc(r.url||'')}</span>
+      <span style="color:var(--amber);margin-left:8px;">${r.confidence||0}%</span>
+    </div>`).join('');
+  const tgRows=(res.telegram||[]).slice(0,10).map(r=>`<div style="margin-top:4px;padding:4px 8px;border-left:2px solid var(--accent);">
+      <span style="color:var(--accent-hi)">Telegram: ${esc(r.channel_name||'unknown')}</span>
+      <span style="color:var(--text-2);margin-left:8px;">${esc((r.text||'').substring(0,160))}</span>
+    </div>`).join('');
+  el.innerHTML=`<span style="color:var(--red)">⚠ Found ${res.total.toLocaleString()} match(es)</span>`+
+    (exposureRows?`<div style="margin-top:6px;color:var(--text-3);font-size:11px;">Imported dump entities</div>${exposureRows}`:'')+
+    (leakRows?`<div style="margin-top:6px;color:var(--text-3);font-size:11px;">Leak pages</div>${leakRows}`:'')+
+    (tgRows?`<div style="margin-top:6px;color:var(--text-3);font-size:11px;">Telegram</div>${tgRows}`:'');
 }
 
 
@@ -4469,7 +4621,8 @@ async function loadNetwork(){
 async function searchContext(){
   const q = document.getElementById('contextQ').value.trim();
   if(!q || q.length<2) return;
-  const el = document.getElementById('contextResults');
+  const el = document.getElementById('isResults-context');
+  el.style.display='block';
   el.innerHTML='<span style="color:var(--accent2)">Searching...</span>';
   const res = await fetch(`/api/search/context?q=${encodeURIComponent(q)}&max=20`)
     .then(r=>r.json()).catch(()=>null);
