@@ -101,7 +101,7 @@ pip install -r requirements.txt
 
 ### 3. Configure environment variables
 
-Create a local `.env` file or export variables in your shell. Do not commit `.env`.
+Create a local `.env` file or export variables in your shell.
 
 ```bash
 export RANSOMWARE_LIVE_API_KEY="your_ransomware_live_api_key"
@@ -152,8 +152,6 @@ export TG_API_ID="your_telegram_api_id"
 export TG_API_HASH="your_telegram_api_hash"
 python3 telegram_monitor.py
 ```
-
-The first run may ask for Telegram login verification and then create a local session file. Do not commit `*.session` files.
 
 ### Intelligence Worker
 
