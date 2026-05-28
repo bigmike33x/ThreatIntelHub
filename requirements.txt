@@ -1,9 +1,20 @@
-# Core crawler
-scrapy>=2.11
-PySocks>=1.7
+# Core runtime
+requests>=2.31
+beautifulsoup4>=4.12
 
-# Telegram monitor (optional)
+# Telegram monitoring
 telethon>=1.34
 
-# Language detection (optional — improves site categorization)
+# Message/intel enrichment
+iocextract>=1.16
 langdetect>=1.0.9
+
+# Optional NLP enrichment used by intelligence_worker.py
+spacy>=3.7
+
+# Archive extraction support
+py7zr>=0.21
+
+# Optional legacy SOCKS support.
+# Keep this only if you still run legacy SOCKS/Tor-based scripts.
+PySocks>=1.7
