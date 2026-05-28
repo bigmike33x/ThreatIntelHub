@@ -18,6 +18,8 @@ import re
 import socks
 import socket
 import json
+import math
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import urlparse
@@ -49,64 +51,290 @@ PASTE_SITES = [
         'index':   'http://ej3kv4ebuugcmuwxctx5ic7zxh73rnxt42soi3tdneu2c2em55thufqd.onion/',
         'link_re': r'href="(/\?[a-zA-Z0-9_-]+)"',
     },
-    # Deep Paste — updated address
-    {
-        'name':    'Deep Paste',
-        'url':     'http://depastedihrn3jtw.onion/',
-        'index':   'http://depastedihrn3jtw.onion/',
-        'link_re': r'href="(show\.php\?md5=[a-f0-9]+)"',
-    },
-    # Stronghold pastebin
-    {
-        'name':    'Stronghold',
-        'url':     'http://nzxj65x32vh2fkhk.onion/',
-        'index':   'http://nzxj65x32vh2fkhk.onion/',
-        'link_re': r'href="(/[a-zA-Z0-9]{6,})"',
-    },
-    # Pastepad
-    {
-        'name':    'Pastepad',
-        'url':     'http://mc6nld3smffo3vgm.onion/',
-        'index':   'http://mc6nld3smffo3vgm.onion/',
-        'link_re': r'href="(/[a-zA-Z0-9]{6,})"',
-    },
-    # Prvt.zone
-    {
-        'name':    'Prvt.zone',
-        'url':     'http://jjfcjwxf3szomuas.onion/',
-        'index':   'http://jjfcjwxf3szomuas.onion/',
-        'link_re': r'href="(/[a-zA-Z0-9_-]{6,})"',
-    },
+
 ]
 
 # ── Check interval per site ────────────────────────────────────────────────────
 CHECK_INTERVAL = 300  # 5 minutes between checks per site
 
-# ── Leak detection ─────────────────────────────────────────────────────────────
-EMAIL_RE  = re.compile(r'[\w\.-]+@[\w\.-]+\.\w{2,}')
-HASH_RE   = re.compile(r'\b([a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64})\b', re.I)
-CVE_RE    = re.compile(r'CVE-\d{4}-\d{4,7}', re.I)
-SSN_RE    = re.compile(r'\b\d{3}-\d{2}-\d{4}\b')
-RECORD_RE = re.compile(r'(\d+[\.,]?\d*)\s*(million|k|thousand)\s*(records?|accounts?|emails?)', re.I)
+# ── Leak / IOC Detection ──────────────────────────────────────────────────────
+
+EMAIL_RE = re.compile(r'[\w\.-]+@[\w\.-]+\.\w{2,}')
+
+HASH_RE = re.compile(
+    r'\b([a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64})\b',
+    re.I
+)
+
+CVE_RE = re.compile(r'CVE-\d{4}-\d{4,7}', re.I)
+
+SSN_RE = re.compile(r'\b\d{3}-\d{2}-\d{4}\b')
+
+RECORD_RE = re.compile(
+    r'(\d+[\.,]?\d*)\s*(million|k|thousand)\s*(records?|accounts?|emails?)',
+    re.I
+)
+
 MAGNET_RE = re.compile(r'magnet:\?xt=urn:', re.I)
-LEAK_KWS  = [
-    'credential','dump','leak','breach','combo list','stealer',
-    'password','hash','database','ssn','social security','fullz',
-    'username:password','user:pass','email:pass','login:pass',
-    '0day','exploit','cve','vulnerability','rce','sql injection',
-    'ransomware','victim','encrypted','data stolen',
-]
-NOISE_KWS = [
-    'buy now','for sale','contact me','telegram','btc only',
-    'guaranteed','trusted vendor','escrow',
+
+CREDS_RE = re.compile(
+    r'(?im)^([^\s:@]+|[\w\.-]+@[\w\.-]+\.\w{2,})[:;\|](.{4,})$'
+)
+
+BTC_RE = re.compile(
+    r'\b(?:bc1|[13])[a-zA-HJ-NP-Z0-9]{25,59}\b'
+)
+
+ETH_RE = re.compile(
+    r'\b0x[a-fA-F0-9]{40}\b'
+)
+
+IP_RE = re.compile(
+    r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+)
+
+DOMAIN_RE = re.compile(
+    r'\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}\b'
+)
+
+JWT_RE = re.compile(
+    r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9._-]+\.[a-zA-Z0-9._-]+'
+)
+
+TG_RE = re.compile(
+    r'(?:https?://)?t\.me/[A-Za-z0-9_]+'
+)
+
+LARGE_FILE_RE = re.compile(
+    r'\b\d+\s?(gb|mb|tb)\b',
+    re.I
+)
+
+CYRILLIC_RE = re.compile(r'[\u0400-\u04FF]')
+
+API_KEY_RES = {
+    "AWS": re.compile(r'AKIA[0-9A-Z]{16}'),
+    "Google": re.compile(r'AIza[0-9A-Za-z\-_]{35}'),
+    "Stripe": re.compile(r'sk_live_[0-9a-zA-Z]{24,}'),
+    "GitHub": re.compile(r'gh[pousr]_[A-Za-z0-9]{36,}'),
+    "Slack": re.compile(r'xox[baprs]-[A-Za-z0-9-]{10,}')
+}
+
+LEAK_KWS = [
+    'credential','dump','leak','breach','combo list',
+    'stealer','password','hash','database','ssn',
+    'social security','fullz','username:password',
+    'user:pass','email:pass','login:pass',
+    '0day','exploit','cve','vulnerability',
+    'rce','sql injection','ransomware',
+    'victim','encrypted','data stolen',
+    'rdp access','vpn access','initial access',
+    'botnet','loader','stealer logs',
+    'infostealer','redline','raccoon',
+    'vidar','lumma','cobalt strike',
+    'beacon','rat','webshell',
+    'smtp','cpanel','sendgrid',
+    'cookies','session token',
+    '.sql','.csv','.log'
 ]
 
+NOISE_KWS = [
+    'buy now','for sale','contact me',
+    'btc only','guaranteed',
+    'trusted vendor','escrow'
+]
+
+def normalize_content(text):
+    text = re.sub(r'<script.*?</script>', '', text, flags=re.S | re.I)
+    text = re.sub(r'<style.*?</style>', '', text, flags=re.S | re.I)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def shannon_entropy(data):
+    if not data:
+        return 0
+
+    counts = Counter(data)
+    probs = [c / len(data) for c in counts.values()]
+
+    return -sum(p * math.log2(p) for p in probs)
+
+
+def extract_high_entropy_strings(text):
+    hits = []
+
+    for token in re.findall(r'[A-Za-z0-9_\-]{20,}', text):
+        if shannon_entropy(token) > 4.5:
+            hits.append(token[:40])
+
+    return hits[:20]
+
 def analyze(text):
+
     if not text or len(text) < 30:
         return False, 0, {}
-    tl    = text.lower()
+
+    text = normalize_content(text)
+
+    tl = text.lower()
+
     score = 0
-    ext   = {}
+    ext = {}
+
+    # Noise filtering
+    noise_hits = sum(1 for k in NOISE_KWS if k in tl)
+
+    if noise_hits >= 2:
+        return False, 0, {}
+
+    # Emails
+    emails = EMAIL_RE.findall(text)
+
+    if len(emails) >= 5:
+        score += 35
+        ext['sample_emails'] = list(set(emails[:10]))
+
+    elif len(emails) >= 2:
+        score += 15
+
+    # Hashes
+    hashes = HASH_RE.findall(text)
+
+    if len(hashes) >= 5:
+        score += 30
+        ext['hash_count'] = len(hashes)
+
+    elif len(hashes) >= 2:
+        score += 10
+
+    # CVEs
+    cves = list(set(CVE_RE.findall(text)))
+
+    if cves:
+        score += 35
+        ext['cves'] = cves[:20]
+
+    # SSNs
+    if SSN_RE.search(text):
+        score += 40
+        ext['has_ssn'] = True
+
+    # Credential pairs
+    cred_lines = len(CREDS_RE.findall(text))
+
+    if cred_lines >= 10:
+        score += 40
+
+    elif cred_lines >= 3:
+        score += 25
+
+    if cred_lines:
+        ext['cred_lines'] = cred_lines
+
+    # Record counts
+    records = RECORD_RE.findall(text)
+
+    if records:
+        score += 20
+        ext['record_counts'] = [
+            f"{m[0]} {m[1]} {m[2]}"
+            for m in records[:5]
+        ]
+
+    # Magnet links
+    if MAGNET_RE.search(text):
+        score += 15
+        ext['has_magnet'] = True
+
+    # Crypto wallets
+    btc_wallets = BTC_RE.findall(text)
+    eth_wallets = ETH_RE.findall(text)
+
+    if btc_wallets or eth_wallets:
+        score += 15
+
+        ext['crypto_wallets'] = {
+            'btc': list(set(btc_wallets[:5])),
+            'eth': list(set(eth_wallets[:5]))
+        }
+
+    # Infrastructure
+    ips = list(set(IP_RE.findall(text)))
+    domains = list(set(DOMAIN_RE.findall(text)))
+
+    if ips:
+        ext['ips'] = ips[:20]
+        score += 10
+
+    if domains:
+        ext['domains'] = domains[:20]
+
+    # JWTs
+    jwts = JWT_RE.findall(text)
+
+    if jwts:
+        score += 20
+        ext['jwt_count'] = len(jwts)
+
+    # Telegram
+    tgs = TG_RE.findall(text)
+
+    if tgs:
+        ext['telegram'] = list(set(tgs[:10]))
+
+    # API keys
+    api_hits = {}
+
+    for name, regex in API_KEY_RES.items():
+
+        hits = regex.findall(text)
+
+        if hits:
+            api_hits[name] = len(hits)
+            score += 25
+
+    if api_hits:
+        ext['api_keys'] = api_hits
+
+    # Large dump indicators
+    if LARGE_FILE_RE.search(text):
+        score += 10
+
+    # Keywords
+    kw_hits = [k for k in LEAK_KWS if k in tl]
+
+    score += min(len(kw_hits) * 4, 25)
+
+    if kw_hits:
+        ext['signals'] = kw_hits[:15]
+
+    # Cyrillic
+    if CYRILLIC_RE.search(text):
+        ext['contains_cyrillic'] = True
+
+    # High entropy strings
+    entropy_hits = extract_high_entropy_strings(text)
+
+    if entropy_hits:
+        score += 10
+        ext['high_entropy_strings'] = entropy_hits[:10]
+
+    # Severity
+    if score >= 75:
+        ext['severity'] = 'critical'
+
+    elif score >= 55:
+        ext['severity'] = 'high'
+
+    elif score >= 35:
+        ext['severity'] = 'medium'
+
+    else:
+        ext['severity'] = 'low'
+
+    return score >= 35, min(score, 100), ext
 
     # Hard noise filter
     if sum(1 for k in NOISE_KWS if k in tl) >= 2:
@@ -171,7 +399,18 @@ def tor_get(url, timeout=20):
     s.settimeout(timeout)
 
     try:
-        s.connect((host, port))
+        connected = False
+
+        for _ in range(2):
+            try:
+                s.connect((host, port))
+                connected = True
+                break
+            except Exception:
+                time.sleep(2)
+
+        if not connected:
+            return None, None
         req = (
             f"GET {path} HTTP/1.1\r\n"
             f"Host: {host}\r\n"
@@ -240,7 +479,9 @@ def ensure_tables():
     con.close()
 
 def content_hash(text):
-    return hashlib.md5((text or '').encode()).hexdigest()
+    return hashlib.sha256(
+        (text or '').encode('utf-8', errors='ignore')
+    ).hexdigest()
 
 def is_known(url):
     con = db()
@@ -325,8 +566,12 @@ def check_site(site):
 
         # Fetch the paste content
         content, _ = tor_get(full_url)
+
         if not content or len(content.strip()) < 30:
             continue
+
+        # Normalize HTML/text before analysis
+        content = normalize_content(content)
 
         # Skip if identical content already saved from another source
         if is_duplicate_content(content):

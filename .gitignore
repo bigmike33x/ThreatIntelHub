@@ -1,41 +1,58 @@
-# Crawl data and generated output — never commit
-results.jsonl
-leaks.jsonl
-organized_results.json
-onion_dashboard.html
-crawler.db
-
-# Generated files
-cti_seeds.json
-migrate_to_db.py
-
-# Telegram sessions and private state
-tg_session.session
-*.session
-
-# Scrapy state and resume data
-crawl_job/
-crawl_state/
-.scrapy/
-.crawler_state.json
-
+```gitignore
 # Python
-venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Database / runtime data
+*.db
+*.sqlite
+crawler.db
+results.jsonl
+organized_results.json
+*.jsonl
 
 # Logs
-telegram.log
 *.log
+logs/
+
+# Telegram sessions
+*.session
+*.session-journal
+
+# Temporary processing
+leak_processing_tmp/
+downloads/
+tmp/
+temp/
 
 # OS files
 .DS_Store
 Thumbs.db
 
-# Editor / IDE
+# IDE
 .vscode/
 .idea/
-*.swp
+
+# Archive files
+*.zip
+*.7z
+*.rar
+
+# Git internals (safety)
+.git/
+```

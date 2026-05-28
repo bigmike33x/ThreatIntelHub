@@ -1,7 +1,9 @@
+# -*- coding: utf-8 -*-
 """
 server_v2.py — Dark Crawler dashboard backed by SQLite
 """
 import http.server, socketserver, threading, subprocess
+import os
 import json, sys, sqlite3, time, hashlib, re
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote_plus
@@ -12,6 +14,7 @@ RESULTS    = BASE_DIR / "results.jsonl"
 LEAKS_FILE = BASE_DIR / "leaks.jsonl"
 _STATE_FILE= BASE_DIR / ".crawler_state.json"
 PORT       = 8765
+RANSOMWARE_LIVE_API_KEY = os.environ.get("RANSOMWARE_LIVE_API_KEY", "")
 
 # ── Language detection ─────────────────────────────────────────────────────────
 try:
@@ -141,6 +144,425 @@ def db():
     con.execute("PRAGMA temp_store=MEMORY")  # temp tables in RAM
     return con
 
+
+def table_exists(con, name):
+    try:
+        return con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            (name,)
+        ).fetchone() is not None
+    except Exception:
+        return False
+
+def column_exists(con, table, column):
+    try:
+        return column in {r[1] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return False
+
+def attach_telegram_intel(con, message_rows):
+    """Attach read-only enrichment data to Telegram message rows for UI display.
+    Safe if intelligence_worker tables/columns do not exist yet.
+    """
+    messages = [dict(r) for r in message_rows]
+    if not messages:
+        return messages
+
+    ids = [m.get('id') for m in messages if m.get('id') is not None]
+    if not ids:
+        return messages
+
+    by_id = {m['id']: m for m in messages}
+    placeholders = ','.join('?' for _ in ids)
+
+    # Defaults keep the old UI/API behavior if intel tables are missing.
+    for m in messages:
+        m['intel_tags'] = {}
+        m['intel_iocs'] = {}
+        m['intel_ioc_count'] = 0
+        m['intel_tag_count'] = 0
+        if 'is_duplicate' not in m:
+            m['is_duplicate'] = 0
+
+    try:
+        # Add source tier from telegram_channels when available.
+        if table_exists(con, 'telegram_channels') and column_exists(con, 'telegram_channels', 'source_tier'):
+            chan_ids = sorted({str(m.get('channel_id')) for m in messages if m.get('channel_id')})
+            if chan_ids:
+                cp = ','.join('?' for _ in chan_ids)
+                chan_rows = con.execute(
+                    f"SELECT channel_id, COALESCE(source_tier,'unknown') AS source_tier FROM telegram_channels WHERE channel_id IN ({cp})",
+                    chan_ids
+                ).fetchall()
+                tier_by_chan = {str(r['channel_id']): r['source_tier'] for r in chan_rows}
+                for m in messages:
+                    m['source_tier'] = tier_by_chan.get(str(m.get('channel_id')), 'unknown')
+
+        if table_exists(con, 'msg_tags'):
+            has_conf = column_exists(con, 'msg_tags', 'confidence')
+            conf_select = ', confidence' if has_conf else ', 50 AS confidence'
+            tag_rows = con.execute(
+                f"SELECT msg_id, tag_type, tag_value{conf_select} "
+                f"FROM msg_tags WHERE msg_id IN ({placeholders}) "
+                "ORDER BY confidence DESC, tag_type, tag_value",
+                ids
+            ).fetchall()
+            for r in tag_rows:
+                mid = r['msg_id']
+                if mid not in by_id:
+                    continue
+                tags = by_id[mid]['intel_tags'].setdefault(r['tag_type'], [])
+                if len(tags) < 8:
+                    tags.append({'value': r['tag_value'], 'confidence': r['confidence']})
+                by_id[mid]['intel_tag_count'] += 1
+
+        if table_exists(con, 'ioc_links') and table_exists(con, 'iocs'):
+            quality_select = 'COALESCE(i.quality, 50)' if column_exists(con, 'iocs', 'quality') else '50'
+            ioc_rows = con.execute(
+                f"SELECT l.msg_id, i.type, i.value, {quality_select} AS quality "
+                f"FROM ioc_links l JOIN iocs i ON i.id=l.ioc_id "
+                f"WHERE l.msg_id IN ({placeholders}) "
+                "ORDER BY quality DESC, i.type, i.value",
+                ids
+            ).fetchall()
+            for r in ioc_rows:
+                mid = r['msg_id']
+                if mid not in by_id:
+                    continue
+                iocs = by_id[mid]['intel_iocs'].setdefault(r['type'], [])
+                if len(iocs) < 8:
+                    iocs.append({'value': r['value'], 'quality': r['quality']})
+                by_id[mid]['intel_ioc_count'] += 1
+    except Exception:
+        # Never let enrichment display break the Telegram tab.
+        return messages
+
+    return messages
+
+def ransomware_telegram_correlation(con, group_name):
+    """Build read-only Telegram intel correlation for a ransomware group name.
+    Uses enriched msg_tags/iocs when present and falls back to raw Telegram text search.
+    Never writes to the DB.
+    """
+    name = (group_name or '').strip()
+    term = re.sub(r'\s+', ' ', name.lower()).replace(' ransomware', '').strip()
+    if not term or not table_exists(con, 'telegram_messages'):
+        return {"group": name, "mentions": 0, "mentions_24h": 0, "mentions_7d": 0,
+                "last_seen": None, "top_channels": [], "top_ttps": [],
+                "related_iocs": [], "related_cves": [], "recent_messages": []}
+
+    like = f"%{term}%"
+    match_parts = ["LOWER(tm.text) LIKE ?"]
+    params = [like]
+
+    if table_exists(con, 'msg_tags'):
+        match_parts.insert(0, "EXISTS (SELECT 1 FROM msg_tags mt WHERE mt.msg_id=tm.id AND mt.tag_type IN ('actor','ner_ransom_group','ner_threat_actor') AND LOWER(mt.tag_value) LIKE ?)")
+        params.insert(0, like)
+
+    where_sql = "(" + " OR ".join(match_parts) + ")"
+    if column_exists(con, 'telegram_messages', 'is_duplicate'):
+        where_sql += " AND COALESCE(tm.is_duplicate,0)=0"
+
+    def run(sql):
+        return con.execute(sql, params).fetchall()
+
+    try:
+        now_ts = int(time.time())
+        summary = con.execute(f"""
+            SELECT COUNT(*) AS mentions,
+                   MAX(tm.timestamp) AS last_seen,
+                   SUM(CASE WHEN tm.timestamp>=? THEN 1 ELSE 0 END) AS mentions_24h,
+                   SUM(CASE WHEN tm.timestamp>=? THEN 1 ELSE 0 END) AS mentions_7d
+            FROM telegram_messages tm
+            WHERE {where_sql}
+        """, [now_ts - 86400, now_ts - 7*86400] + params).fetchone()
+
+        tier_expr = "COALESCE(tc.source_tier,'unknown')" if column_exists(con, 'telegram_channels', 'source_tier') else "'unknown'"
+        top_channels = run(f"""
+            SELECT COALESCE(tm.channel_name,'unknown') AS channel_name,
+                   COUNT(*) AS mentions,
+                   MAX(tm.timestamp) AS last_seen,
+                   {tier_expr} AS source_tier
+            FROM telegram_messages tm
+            LEFT JOIN telegram_channels tc ON tc.channel_id=tm.channel_id
+            WHERE {where_sql}
+            GROUP BY COALESCE(tm.channel_name,'unknown'), {tier_expr}
+            ORDER BY mentions DESC, last_seen DESC
+            LIMIT 8
+        """)
+
+        top_ttps = []
+        if table_exists(con, 'msg_tags'):
+            conf_expr = 'COALESCE(mt.confidence,50)' if column_exists(con, 'msg_tags', 'confidence') else '50'
+            top_ttps = run(f"""
+                SELECT mt.tag_value, COUNT(*) AS mentions, ROUND(AVG({conf_expr})) AS avg_confidence
+                FROM telegram_messages tm
+                JOIN msg_tags mt ON mt.msg_id=tm.id
+                WHERE {where_sql} AND mt.tag_type='ttp'
+                GROUP BY mt.tag_value
+                ORDER BY mentions DESC, avg_confidence DESC
+                LIMIT 8
+            """)
+
+        related_iocs = []
+        related_cves = []
+        if table_exists(con, 'ioc_links') and table_exists(con, 'iocs'):
+            quality_expr = 'COALESCE(i.quality,50)' if column_exists(con, 'iocs', 'quality') else '50'
+            related_iocs = run(f"""
+                SELECT i.type, i.value, COUNT(*) AS mentions, MAX({quality_expr}) AS quality
+                FROM telegram_messages tm
+                JOIN ioc_links il ON il.msg_id=tm.id
+                JOIN iocs i ON i.id=il.ioc_id
+                WHERE {where_sql} AND i.type NOT IN ('domain','url')
+                GROUP BY i.type, i.value
+                ORDER BY mentions DESC, quality DESC
+                LIMIT 12
+            """)
+            related_cves = run(f"""
+                SELECT i.value AS cve, COUNT(*) AS mentions, MAX(tm.timestamp) AS last_seen
+                FROM telegram_messages tm
+                JOIN ioc_links il ON il.msg_id=tm.id
+                JOIN iocs i ON i.id=il.ioc_id
+                WHERE {where_sql} AND i.type='cve'
+                GROUP BY i.value
+                ORDER BY mentions DESC, last_seen DESC
+                LIMIT 10
+            """)
+
+        recent_rows = run(f"""
+            SELECT tm.*
+            FROM telegram_messages tm
+            WHERE {where_sql}
+            ORDER BY tm.timestamp DESC
+            LIMIT 8
+        """)
+        recent_messages = attach_telegram_intel(con, recent_rows)
+
+        return {
+            "group": name,
+            "mentions": int(summary['mentions'] or 0),
+            "mentions_24h": int(summary['mentions_24h'] or 0),
+            "mentions_7d": int(summary['mentions_7d'] or 0),
+            "last_seen": summary['last_seen'],
+            "top_channels": [dict(r) for r in top_channels],
+            "top_ttps": [dict(r) for r in top_ttps],
+            "related_iocs": [dict(r) for r in related_iocs],
+            "related_cves": [dict(r) for r in related_cves],
+            "recent_messages": recent_messages,
+        }
+    except Exception as e:
+        return {"group": name, "error": str(e), "mentions": 0, "mentions_24h": 0,
+                "mentions_7d": 0, "last_seen": None, "top_channels": [],
+                "top_ttps": [], "related_iocs": [], "related_cves": [], "recent_messages": []}
+
+
+def ransomware_victim_timeline(con, group_name, victim_name, victim_domain='', published_ts=0):
+    """Build a read-only Telegram timeline for a ransomware victim.
+    Searches Telegram text for victim name/domain and returns before/after events.
+    Never writes to the DB.
+    """
+    group = (group_name or '').strip()
+    victim = re.sub(r'\s+', ' ', (victim_name or '').strip())
+    domain = (victim_domain or '').strip().lower()
+    try:
+        published_ts = int(published_ts or 0)
+    except Exception:
+        published_ts = 0
+
+    empty = {"group": group, "victim": victim, "domain": domain,
+             "published_ts": published_ts, "mentions": 0, "before": 0,
+             "after": 0, "first_seen": None, "last_seen": None,
+             "top_channels": [], "related_iocs": [], "related_cves": [],
+             "timeline": []}
+
+    if not victim or len(victim) < 3 or not table_exists(con, 'telegram_messages'):
+        return empty
+
+    terms = []
+    # Victim/company name is the main match term.
+    terms.append(victim.lower())
+    # Domain match is stronger when ransomware.live provides one.
+    if domain and len(domain) > 3:
+        terms.append(domain)
+        root = domain.split('/')[0].replace('www.', '')
+        if root and root not in terms:
+            terms.append(root)
+
+    # Avoid huge noisy searches from one-word generic victim names.
+    cleaned_terms = []
+    for t in terms:
+        t = re.sub(r'\s+', ' ', t.strip().lower())
+        if len(t) >= 4 and t not in cleaned_terms:
+            cleaned_terms.append(t)
+    if not cleaned_terms:
+        return empty
+
+    parts = ["LOWER(tm.text) LIKE ?" for _ in cleaned_terms]
+    params = [f"%{t}%" for t in cleaned_terms]
+    where_sql = "(" + " OR ".join(parts) + ")"
+    if column_exists(con, 'telegram_messages', 'is_duplicate'):
+        where_sql += " AND COALESCE(tm.is_duplicate,0)=0"
+
+    try:
+        summary = con.execute(f"""
+            SELECT COUNT(*) AS mentions,
+                   MIN(tm.timestamp) AS first_seen,
+                   MAX(tm.timestamp) AS last_seen,
+                   SUM(CASE WHEN ? > 0 AND tm.timestamp < ? THEN 1 ELSE 0 END) AS before_count,
+                   SUM(CASE WHEN ? > 0 AND tm.timestamp >= ? THEN 1 ELSE 0 END) AS after_count
+            FROM telegram_messages tm
+            WHERE {where_sql}
+        """, [published_ts, published_ts, published_ts, published_ts] + params).fetchone()
+
+        tier_expr = "COALESCE(tc.source_tier,'unknown')" if column_exists(con, 'telegram_channels', 'source_tier') else "'unknown'"
+        top_channels = con.execute(f"""
+            SELECT COALESCE(tm.channel_name,'unknown') AS channel_name,
+                   COUNT(*) AS mentions,
+                   MAX(tm.timestamp) AS last_seen,
+                   {tier_expr} AS source_tier
+            FROM telegram_messages tm
+            LEFT JOIN telegram_channels tc ON tc.channel_id=tm.channel_id
+            WHERE {where_sql}
+            GROUP BY COALESCE(tm.channel_name,'unknown'), {tier_expr}
+            ORDER BY mentions DESC, last_seen DESC
+            LIMIT 8
+        """, params).fetchall()
+
+        related_iocs = []
+        related_cves = []
+        if table_exists(con, 'ioc_links') and table_exists(con, 'iocs'):
+            quality_expr = 'COALESCE(i.quality,50)' if column_exists(con, 'iocs', 'quality') else '50'
+            related_iocs = con.execute(f"""
+                SELECT i.type, i.value, COUNT(*) AS mentions, MAX({quality_expr}) AS quality
+                FROM telegram_messages tm
+                JOIN ioc_links il ON il.msg_id=tm.id
+                JOIN iocs i ON i.id=il.ioc_id
+                WHERE {where_sql} AND i.type NOT IN ('domain','url')
+                GROUP BY i.type, i.value
+                ORDER BY mentions DESC, quality DESC
+                LIMIT 12
+            """, params).fetchall()
+            related_cves = con.execute(f"""
+                SELECT i.value AS cve, COUNT(*) AS mentions, MAX(tm.timestamp) AS last_seen
+                FROM telegram_messages tm
+                JOIN ioc_links il ON il.msg_id=tm.id
+                JOIN iocs i ON i.id=il.ioc_id
+                WHERE {where_sql} AND i.type='cve'
+                GROUP BY i.value
+                ORDER BY mentions DESC, last_seen DESC
+                LIMIT 10
+            """, params).fetchall()
+
+        rows = con.execute(f"""
+            SELECT tm.*
+            FROM telegram_messages tm
+            WHERE {where_sql}
+            ORDER BY tm.timestamp ASC
+            LIMIT 80
+        """, params).fetchall()
+        messages = attach_telegram_intel(con, rows)
+
+        # If the victim was published, keep the timeline focused around the event.
+        if published_ts:
+            start = published_ts - 45*86400
+            end = published_ts + 30*86400
+            focused = [m for m in messages if m.get('timestamp') and start <= int(m.get('timestamp')) <= end]
+            if focused:
+                messages = focused
+
+        for m in messages:
+            ts = int(m.get('timestamp') or 0)
+            if published_ts and ts:
+                if ts < published_ts:
+                    m['timeline_relation'] = 'before'
+                    m['days_from_publish'] = int((published_ts - ts) / 86400)
+                elif ts >= published_ts:
+                    m['timeline_relation'] = 'after'
+                    m['days_from_publish'] = int((ts - published_ts) / 86400)
+            else:
+                m['timeline_relation'] = 'seen'
+                m['days_from_publish'] = None
+
+        return {
+            "group": group,
+            "victim": victim,
+            "domain": domain,
+            "published_ts": published_ts,
+            "mentions": int(summary['mentions'] or 0),
+            "before": int(summary['before_count'] or 0),
+            "after": int(summary['after_count'] or 0),
+            "first_seen": summary['first_seen'],
+            "last_seen": summary['last_seen'],
+            "top_channels": [dict(r) for r in top_channels],
+            "related_iocs": [dict(r) for r in related_iocs],
+            "related_cves": [dict(r) for r in related_cves],
+            "timeline": messages[-40:],
+        }
+    except Exception as e:
+        out = dict(empty)
+        out['error'] = str(e)
+        return out
+
+
+
+def ensure_leak_archive_tables(con=None):
+    """Create archive import queue/status tables used by leak_archive_worker.py."""
+    own = con is None
+    if own:
+        con = db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS leak_archives (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        download_url TEXT,
+        victim_name TEXT,
+        actor TEXT,
+        leak_name TEXT,
+        source_type TEXT,
+        local_path TEXT,
+        sha256 TEXT,
+        status TEXT DEFAULT 'queued',
+        malware_detected INTEGER DEFAULT 0,
+        malware_signature TEXT,
+        scan_result TEXT,
+        error TEXT,
+        files_found INTEGER DEFAULT 0,
+        files_processed INTEGER DEFAULT 0,
+        entities_imported INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS leak_archive_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        archive_id INTEGER,
+        file_path TEXT,
+        file_ext TEXT,
+        size_bytes INTEGER,
+        detected_type TEXT,
+        score INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'queued',
+        reason TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_leak_archives_status ON leak_archives(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_leak_archive_files_archive ON leak_archive_files(archive_id);
+    """)
+    if own:
+        con.commit()
+        con.close()
+
+def start_leak_archive_worker(job_id):
+    """Start one archive import job without blocking the dashboard."""
+    worker = BASE_DIR / "leak_archive_worker.py"
+    if not worker.exists():
+        return {"ok": False, "reason": "leak_archive_worker.py not found in project folder"}
+    subprocess.Popen(
+        [sys.executable, str(worker), "--job-id", str(job_id)],
+        cwd=str(BASE_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    return {"ok": True}
+
 def ensure_indexes():
     con = db()
     con.executescript("""
@@ -154,13 +576,11 @@ def ensure_indexes():
         CREATE INDEX IF NOT EXISTS idx_leaks_ts          ON leaks(timestamp DESC);
         CREATE INDEX IF NOT EXISTS idx_tgmsg_leak        ON telegram_messages(has_leak,confidence DESC);
         CREATE INDEX IF NOT EXISTS idx_tgmsg_chan        ON telegram_messages(channel_id);
+        CREATE INDEX IF NOT EXISTS idx_tgchan_source     ON telegram_channels(source_tier);
     """)
     con.commit(); con.close()
 
 def ensure_db():
-    if not DB_PATH.exists() and RESULTS.exists():
-        import migrate_to_db
-        migrate_to_db.main()
     con = db()
     con.executescript('''
     CREATE TABLE IF NOT EXISTS sites (
@@ -263,23 +683,80 @@ def ensure_db():
         status          INTEGER,
         content_changed INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS telegram_channels (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        url          TEXT UNIQUE,
+        name         TEXT,
+        channel_id   TEXT,
+        channel_type TEXT DEFAULT 'cti',
+        joined       INTEGER DEFAULT 0,
+        active       INTEGER DEFAULT 1,
+        message_count INTEGER DEFAULT 0,
+        last_message INTEGER,
+        discovered_from TEXT,
+        source_tier TEXT DEFAULT 'unknown'
+    );
+    CREATE TABLE IF NOT EXISTS telegram_messages (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id  TEXT,
+        channel_name TEXT,
+        message_id  INTEGER,
+        text        TEXT,
+        timestamp   INTEGER,
+        has_leak    INTEGER DEFAULT 0,
+        confidence  INTEGER DEFAULT 0,
+        UNIQUE(channel_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tgmsg_leak ON telegram_messages(has_leak,confidence DESC);
+    CREATE INDEX IF NOT EXISTS idx_tgmsg_chan ON telegram_messages(channel_id);
+    CREATE TABLE IF NOT EXISTS paste_items (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        site_name  TEXT,
+        url        TEXT UNIQUE,
+        content    TEXT,
+        has_leak   INTEGER DEFAULT 0,
+        confidence INTEGER DEFAULT 0,
+        first_seen INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS stealer_logs (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        filename  TEXT UNIQUE,
+        log_type  TEXT,
+        parsed_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS stealer_credentials (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        log_id   INTEGER,
+        url      TEXT,
+        username TEXT,
+        password TEXT
+    );
+    CREATE TABLE IF NOT EXISTS canary_hits (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        token_id   TEXT,
+        token_type TEXT,
+        memo       TEXT,
+        src_ip     TEXT,
+        geo        TEXT,
+        useragent  TEXT,
+        raw        TEXT,
+        timestamp  INTEGER
+    );
     ''')
-    # Auto-queue all clean high-score sites for re-crawl if queue is empty
-    # Uses tiered intervals — high-activity categories checked more often
-    count = con.execute("SELECT COUNT(*) FROM recrawl_queue").fetchone()[0]
-    if count == 0:
-        now = int(time.time())
-        sites = con.execute(
-            "SELECT id,url,category FROM sites WHERE noise=0 AND score>=10 LIMIT 500"
-        ).fetchall()
-        for s in sites:
-            interval_h = RECRAWL_INTERVALS.get(s['category'], 48)
-            con.execute(
-                "INSERT OR IGNORE INTO recrawl_queue "
-                "(site_id,url,interval_h,last_crawled,next_crawl) VALUES(?,?,?,?,?)",
-                (s['id'], s['url'], interval_h, now, now + interval_h * 3600))
-    con.commit()
-    con.close()
+    # Safe Telegram channel/source migrations used by the Telegram intel UI.
+    tg_chan_cols = {r[1] for r in con.execute("PRAGMA table_info(telegram_channels)").fetchall()}
+    if 'source_tier' not in tg_chan_cols:
+        con.execute("ALTER TABLE telegram_channels ADD COLUMN source_tier TEXT DEFAULT 'unknown'")
+
+    tg_msg_cols = {r[1] for r in con.execute("PRAGMA table_info(telegram_messages)").fetchall()}
+    if 'intel_processed' not in tg_msg_cols:
+        con.execute("ALTER TABLE telegram_messages ADD COLUMN intel_processed INTEGER DEFAULT 0")
+    if 'is_duplicate' not in tg_msg_cols:
+        con.execute("ALTER TABLE telegram_messages ADD COLUMN is_duplicate INTEGER DEFAULT 0")
+    if 'msg_hash' not in tg_msg_cols:
+        con.execute("ALTER TABLE telegram_messages ADD COLUMN msg_hash TEXT")
+
+    ensure_leak_archive_tables(con)
 
 def update_trust_scores():
     """Recalculate trust scores for all sites — runs after re-crawl updates."""
@@ -342,330 +819,7 @@ def run_alerts(new_site_ids, new_leak_ids):
     con.commit()
     con.close()
 
-# ── State persistence ──────────────────────────────────────────────────────────
-def _load_state():
-    try:
-        s = json.loads(_STATE_FILE.read_text())
-        return s.get("results_pos",0), s.get("leaks_pos",0)
-    except: return 0, 0
 
-def _save_state():
-    try:
-        _STATE_FILE.write_text(json.dumps({
-            "results_pos": _results_pos,
-            "leaks_pos":   _leaks_pos,
-        }))
-    except: pass
-
-_results_pos, _leaks_pos = _load_state()
-_mirror_batch = 0
-
-# ── Ingest ─────────────────────────────────────────────────────────────────────
-def ingest_new():
-    global _results_pos, _mirror_batch
-    if not RESULTS.exists(): return [], 0
-    con = db()
-    new_ids, new_count = [], 0
-    try:
-        with open(RESULTS, encoding='utf-8') as f:
-            f.seek(_results_pos)
-            for line in f:
-                line = line.strip()
-                if not line: continue
-                try:
-                    e   = json.loads(line)
-                    url = e.get('url','')
-                    if not url: continue
-                    host  = url.split('/')[2] if '//' in url else url
-                    s     = base_score(e)
-                    # Hard reject CSAM — never save, never show
-                    if is_csam(e.get('title',''), e.get('body_preview','')):
-                        continue
-
-                    noise = 1 if (e.get('status')!=200 or
-                                  len((e.get('body_preview') or '').strip())<20 or
-                                  s<-5) else 0
-                    chash = content_hash(e.get('body_preview',''))
-                    lang  = detect_language(e.get('body_preview',''))
-                    now   = int(time.time())
-                    # Skip if identical content already exists (mirror/repost)
-                    if chash and con.execute(
-                        "SELECT id FROM sites WHERE content_hash=? AND noise=0 LIMIT 1",
-                        (chash,)).fetchone():
-                        continue
-                    con.execute('''INSERT OR IGNORE INTO sites
-                        (url,host,title,status,preview,category,score,trust_score,
-                         noise,bookmarked,reviewed,notes,timestamp,last_seen,
-                         content_hash,language)
-                        VALUES (?,?,?,?,?,?,?,0,?,0,0,"",?,?,?,?)''',
-                        (url,host,e.get('title',''),e.get('status',0),
-                         e.get('body_preview',''),categorize(e),s,noise,
-                         e.get('timestamp',now),now,chash,lang))
-                    if con.lastrowid:
-                        rowid = con.lastrowid
-                        con.execute(
-                            "INSERT INTO sites_fts(rowid,url,title,preview,category) VALUES(?,?,?,?,?)",
-                            (rowid,url,e.get('title',''),e.get('body_preview',''),categorize(e)))
-                        # Save file links
-                        for fl in json.loads(e.get('file_links','[]') or '[]'):
-                            try:
-                                con.execute(
-                                    "INSERT OR IGNORE INTO file_links (site_id,url,extension,timestamp) VALUES(?,?,?,?)",
-                                    (rowid,fl[0],fl[1],now))
-                            except: pass
-                        new_ids.append(rowid)
-                        new_count += 1
-                except: pass
-        # Save position at end of file
-        with open(RESULTS, encoding='utf-8') as f:
-            f.seek(0,2); _results_pos = f.tell()
-        _save_state()
-    except Exception as ex:
-        pass
-    con.commit()
-    con.close()
-    if new_ids:
-        _mirror_batch += len(new_ids)
-        if _mirror_batch >= 50:
-            group_mirrors()
-            _mirror_batch = 0
-        update_trust_scores()
-        run_alerts(new_ids, [])
-        # Auto-queue new high-score sites for re-crawl
-        _auto_queue_recrawl(new_ids)
-    return new_ids, new_count
-
-def ingest_new_leaks():
-    global _leaks_pos
-    if not LEAKS_FILE.exists(): return [], 0
-    con = db()
-    new_ids, new_count = [], 0
-    try:
-        with open(LEAKS_FILE, encoding='utf-8') as f:
-            f.seek(_leaks_pos)
-            for line in f:
-                line = line.strip()
-                if not line: continue
-                try:
-                    e   = json.loads(line)
-                    url = e.get('url','')
-                    if not url: continue
-                    now = int(time.time())
-                    con.execute('''INSERT OR IGNORE INTO leaks
-                        (url,title,confidence,full_text,cves,breach_targets,
-                         record_counts,exploit_types,has_emails,has_hashes,
-                         has_ssn,has_magnet,timestamp)
-                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                        (url,e.get('title',''),e.get('confidence',0),
-                         e.get('full_text',''),e.get('cves','[]'),
-                         e.get('breach_targets','[]'),e.get('record_counts','[]'),
-                         e.get('exploit_types','[]'),e.get('has_emails',0),
-                         e.get('has_hashes',0),e.get('has_ssn',0),
-                         e.get('has_magnet',0),e.get('timestamp',now)))
-                    if con.lastrowid:
-                        rowid = con.lastrowid
-                        con.execute(
-                            "INSERT INTO leaks_fts(rowid,url,title,full_text,cves,breach_targets) VALUES(?,?,?,?,?,?)",
-                            (rowid,url,e.get('title',''),e.get('full_text','')[:500],
-                             e.get('cves','[]'),e.get('breach_targets','[]')))
-                        new_ids.append(rowid)
-                        new_count += 1
-                except: pass
-        with open(LEAKS_FILE, encoding='utf-8') as f:
-            f.seek(0,2); _leaks_pos = f.tell()
-        _save_state()
-    except: pass
-    con.commit()
-    con.close()
-    if new_ids: run_alerts([], new_ids)
-    return new_ids, new_count
-
-# Tiered re-crawl intervals by category
-RECRAWL_INTERVALS = {
-    "Forums":          12,   # high activity — check twice daily
-    "News & Media":    12,   # high activity
-    "Chat & Messaging":12,
-    "Wikis & Directories": 72,   # moderate — every 3 days
-    "Search Engines":  72,
-    "Blogs":           72,
-    "Libraries":       168,  # weekly — rarely changes
-    "Whistleblower":   168,
-    "Technology":      48,   # every 2 days
-    "Privacy Tools":   48,
-    "Finance & Crypto":48,
-    "Email":           48,
-    "Markets":         48,
-    "Hosting":         96,   # every 4 days
-    "Uncategorized":   48,   # default
-}
-
-def _interval_for(category):
-    return RECRAWL_INTERVALS.get(category, 48)
-
-def _auto_queue_recrawl(new_ids):
-    """Automatically add high-score new sites to re-crawl queue with tiered intervals."""
-    con = db()
-    now = int(time.time())
-    for sid in new_ids:
-        s = con.execute(
-            "SELECT url,score,category FROM sites WHERE id=?", (sid,)
-        ).fetchone()
-        if s and s['score'] >= 10:
-            interval_h = _interval_for(s['category'])
-            con.execute(
-                "INSERT OR IGNORE INTO recrawl_queue "
-                "(site_id,url,interval_h,last_crawled,next_crawl) VALUES(?,?,?,?,?)",
-                (sid, s['url'], interval_h, now, now + interval_h * 3600))
-    con.commit()
-    con.close()
-
-def run_recrawl_due():
-    """Check recrawl_queue and re-fetch sites that are due.
-    
-    Batching strategy:
-    - If main crawl is running: only check 5 sites (don't compete)
-    - If crawler is idle: check up to 25 sites per run
-    - Space requests 3s apart to avoid hammering Tor
-    - Prioritise high-trust sites first
-    """
-    con = db()
-    now = int(time.time())
-    # Reduce batch if main crawl is active
-    batch = 5 if crawler_status() == "running" else 25
-    due = con.execute(
-        "SELECT r.*,s.trust_score FROM recrawl_queue r "
-        "JOIN sites s ON s.id=r.site_id "
-        "WHERE r.next_crawl<=? "
-        "ORDER BY s.trust_score DESC LIMIT ?",
-        (now, batch)
-    ).fetchall()
-    con.close()
-    if not due: return 0
-    # We don't re-run Scrapy for individual sites — instead we update
-    # their last_seen and uptime stats via a lightweight requests check
-    import requests
-    updated = 0
-    for row in due:
-        try:
-            proxies = {"http":"socks5h://127.0.0.1:9050","https":"socks5h://127.0.0.1:9050"}
-            resp = requests.get(row['url'], proxies=proxies, timeout=20)
-            status = resp.status_code
-            new_hash = content_hash(resp.text[:500])
-            con = db()
-            old = con.execute("SELECT content_hash,uptime_count,downtime_count FROM sites WHERE id=?",
-                              (row['site_id'],)).fetchone()
-            changed = 0
-            if old:
-                if status == 200:
-                    new_up = (old['uptime_count'] or 0) + 1
-                    con.execute("UPDATE sites SET last_seen=?,uptime_count=?,status=? WHERE id=?",
-                                (now, new_up, status, row['site_id']))
-                    if old['content_hash'] and old['content_hash'] != new_hash:
-                        changed = 1
-                        con.execute("UPDATE sites SET content_hash=? WHERE id=?",
-                                    (new_hash, row['site_id']))
-                else:
-                    new_down = (old['downtime_count'] or 0) + 1
-                    con.execute("UPDATE sites SET downtime_count=? WHERE id=?",
-                                (new_down, row['site_id']))
-                con.execute("INSERT INTO site_history (site_id,timestamp,status,content_changed) VALUES(?,?,?,?)",
-                            (row['site_id'], now, status, changed))
-                con.execute(
-                    "UPDATE recrawl_queue SET last_crawled=?,next_crawl=?,change_count=change_count+? WHERE site_id=?",
-                    (now, now+row['interval_h']*3600, changed, row['site_id']))
-            con.commit()
-            con.close()
-            updated += 1
-            time.sleep(3)  # space requests to avoid hammering Tor
-        except: pass
-    if updated > 0:
-        update_trust_scores()
-    return updated
-
-# ── Background recrawl thread ──────────────────────────────────────────────────
-def _recrawl_loop():
-    """Background re-crawl loop.
-    
-    Timing:
-    - Checks every 60 minutes normally
-    - If main crawl is running, waits an extra 30 min before checking
-      to avoid competing for Tor bandwidth
-    """
-    while True:
-        try:
-            # If main crawl is running, back off an extra 30 min
-            extra_wait = 1800 if crawler_status() == "running" else 0
-            time.sleep(3600 + extra_wait)
-            n = run_recrawl_due()
-            if n > 0:
-                print(f"[RECRAWL] Updated {n} sites")
-        except: pass
-
-_recrawl_thread = threading.Thread(target=_recrawl_loop, daemon=True)
-
-# ── Crawler process ────────────────────────────────────────────────────────────
-crawler_process  = None
-crawler_lock     = threading.Lock()
-crawl_start_time = None
-crawl_activity   = []
-ACTIVITY_MAX     = 200
-
-def _read_crawler_output(proc):
-    global crawl_activity
-    try:
-        for raw in proc.stderr:
-            line = raw.decode('utf-8', errors='replace').strip()
-            if not line: continue
-            keep = any(tag in line for tag in [
-                '[SAVED','[LEAK','[QUEUE','[SKIP','[BLOCKED','[FAIL','[SEED',
-                'Crawled','ERROR','WARNING','Closing spider','Spider opened','items/min',
-            ])
-            if keep:
-                ts = time.strftime('%H:%M:%S')
-                crawl_activity.append(f"[{ts}] {line}")
-                if len(crawl_activity) > ACTIVITY_MAX:
-                    crawl_activity.pop(0)
-    except: pass
-
-def crawler_status():
-    with crawler_lock:
-        if crawler_process is None: return "idle"
-        return "running" if crawler_process.poll() is None else "finished"
-
-def start_crawler():
-    global crawler_process, crawl_start_time, crawl_activity
-    with crawler_lock:
-        if crawler_process and crawler_process.poll() is None:
-            return {"status":"already_running"}
-        crawl_activity = []
-        job_dir = BASE_DIR / "crawl_job"
-        job_dir.mkdir(exist_ok=True)
-        crawler_process = subprocess.Popen(
-            [sys.executable,"-m","scrapy","crawl","onion_spider",
-             "-s",f"JOBDIR={job_dir}"],
-            cwd=str(BASE_DIR),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE)
-        crawl_start_time = int(time.time())
-        threading.Thread(target=_read_crawler_output,
-                         args=(crawler_process,), daemon=True).start()
-        return {"status":"started"}
-
-def stop_crawler():
-    global crawler_process, crawl_start_time
-    with crawler_lock:
-        if crawler_process and crawler_process.poll() is None:
-            crawler_process.terminate()
-            if crawl_start_time:
-                con = db()
-                total = con.execute("SELECT COUNT(*) FROM sites WHERE noise=0").fetchone()[0]
-                leaks = con.execute("SELECT COUNT(*) FROM leaks").fetchone()[0]
-                con.execute(
-                    "INSERT INTO crawl_log (timestamp,sites_found,leaks_found,duration_s) VALUES(?,?,?,?)",
-                    (int(time.time()),total,leaks,int(time.time())-crawl_start_time))
-                con.commit(); con.close()
-            return {"status":"stopped"}
-        return {"status":"not_running"}
 
 
 
@@ -695,7 +849,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         qs = parse_qs(p.query)
         g  = lambda k,d="": qs.get(k,[d])[0]
 
-        if p.path == "/":
+        if p.path == "/" or p.path.startswith("/group/"):
             body = DASHBOARD_HTML.encode('utf-8')
             self.send_response(200)
             self.send_header("Content-Type","text/html; charset=utf-8")
@@ -704,136 +858,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
-        elif p.path == "/api/start":  self.send_json(start_crawler())
-        elif p.path == "/api/stop":   self.send_json(stop_crawler())
 
         elif p.path == "/api/status":
-            _, new      = ingest_new()
-            _, new_leak = ingest_new_leaks()
             con = db()
-            total   = con.execute("SELECT COUNT(*) FROM sites WHERE noise=0").fetchone()[0]
-            cats    = con.execute("SELECT COUNT(DISTINCT category) FROM sites WHERE noise=0").fetchone()[0]
             leaks_c = con.execute("SELECT COUNT(*) FROM leaks").fetchone()[0]
-            mirrors = con.execute("SELECT COUNT(DISTINCT mirror_group) FROM sites WHERE mirror_group IS NOT NULL").fetchone()[0]
             unseen  = con.execute("SELECT COUNT(*) FROM alert_hits WHERE seen=0").fetchone()[0]
-            due_rc  = con.execute("SELECT COUNT(*) FROM recrawl_queue WHERE next_crawl<=?",(int(time.time()),)).fetchone()[0]
+            tg_msg  = con.execute("SELECT COUNT(*) FROM telegram_messages").fetchone()[0]
+            tg_leak = con.execute("SELECT COUNT(*) FROM telegram_messages WHERE has_leak=1").fetchone()[0]
             con.close()
-            self.send_json({"status":crawler_status(),"total":total,"cats":cats,
-                           "new":new,"new_leak":new_leak,"leaks":leaks_c,
-                           "mirrors":mirrors,"unseen_alerts":unseen,"due_recrawl":due_rc})
+            self.send_json({"leaks":leaks_c,"unseen_alerts":unseen,
+                           "tg_messages":tg_msg,"tg_leaks":tg_leak})
 
-        elif p.path == "/api/sites":
-            q        = g("q"); cat=g("cat"); view=g("view","clean")
-            sort     = g("sort","trust"); page=int(g("page","1"))
-            per_page = 50; offset=(page-1)*per_page
-            con      = db()
-            where, params = [], []
-            if view=="clean":       where.append("noise=0")
-            elif view=="noise":     where.append("noise=1")
-            elif view=="bookmarked":where.append("bookmarked=1")
-            elif view=="reviewed":  where.append("reviewed=1")
-            if cat and cat!="all":  where.append("category=?"); params.append(cat)
-            if q:
-                where.append("id IN (SELECT rowid FROM sites_fts WHERE sites_fts MATCH ?)")
-                params.append(q+"*")
-            w     = ("WHERE "+" AND ".join(where)) if where else ""
-            order = {"trust":"trust_score DESC,score DESC",
-                     "score":"score DESC","newest":"timestamp DESC",
-                     "alpha":"title ASC"}.get(sort,"trust_score DESC")
-            group_by_host = g("group","1") == "1"  # default: group by host
-            if view == "clean":
-                mf = ("AND (mirror_group IS NULL OR id IN ("
-                      "SELECT id FROM sites s2 WHERE s2.mirror_group=sites.mirror_group "
-                      "ORDER BY s2.trust_score DESC LIMIT 1))")
-                if group_by_host and not q:
-                    # Fast grouped query using pre-aggregated host counts
-                    # Step 1: get best site_id per host
-                    noise_clause = "AND s2.noise=0" if view=="clean" else ""
-                    host_query = (
-                        f"SELECT MIN(id) as id, host, COUNT(*) as subpage_count "
-                        f"FROM sites WHERE noise=0 "
-                        f"GROUP BY host"
-                    )
-                    total = con.execute(
-                        f"SELECT COUNT(DISTINCT host) FROM sites WHERE noise=0", []).fetchone()[0]
-                    rows = con.execute(
-                        f"SELECT s.*, h.subpage_count, 0 as mirror_count "
-                        f"FROM sites s "
-                        f"JOIN ({host_query}) h ON h.id=s.id "
-                        f"WHERE s.noise=0 "
-                        f"ORDER BY {order} LIMIT ? OFFSET ?",
-                        [per_page, offset]).fetchall()
-                else:
-                    total = con.execute(f"SELECT COUNT(*) FROM sites {w} {mf}", params).fetchone()[0]
-                    rows  = con.execute(
-                        f"SELECT sites.*, 1 as subpage_count, 0 as mirror_count "
-                        f"FROM sites {w} {mf} ORDER BY {order} LIMIT ? OFFSET ?",
-                        params+[per_page, offset]).fetchall()
-            else:
-                total = con.execute(f"SELECT COUNT(*) FROM sites {w}", params).fetchone()[0]
-                rows  = con.execute(
-                    f"SELECT sites.*,0 as mirror_count,"
-                    f"(SELECT COUNT(*) FROM sites s2 WHERE s2.host=sites.host AND s2.noise=0) as subpage_count "
-                    f"FROM sites {w} ORDER BY {order} LIMIT ? OFFSET ?",
-                    params+[per_page,offset]).fetchall()
-            con.close()
-            self.send_json({"sites":[dict(r) for r in rows],"total":total,"grouped":group_by_host})
 
-        elif p.path == "/api/search/context":
-            # Keyword context — returns snippets with keyword highlighted
-            q      = g("q","").strip()
-            max_r  = min(int(g("max","20")), 50)
-            if not q or len(q) < 2:
-                self.send_json({"results":[]})
-                return
-            con  = db()
-            rows = con.execute(
-                "SELECT id,url,title,preview,category,trust_score FROM sites "
-                "WHERE noise=0 AND (title LIKE ? OR preview LIKE ?) "
-                "ORDER BY trust_score DESC LIMIT ?",
-                (f"%{q}%",f"%{q}%",max_r)).fetchall()
-            results = []
-            for r in rows:
-                # Extract snippet around keyword
-                preview = r['preview'] or ''
-                title   = r['title'] or ''
-                idx = preview.lower().find(q.lower())
-                if idx >= 0:
-                    start   = max(0, idx-60)
-                    end     = min(len(preview), idx+len(q)+60)
-                    snippet = preview[start:end]
-                    # Mark the keyword position for frontend highlighting
-                    kw_start = idx - start
-                    kw_end   = kw_start + len(q)
-                else:
-                    snippet  = preview[:120]
-                    kw_start = -1
-                    kw_end   = -1
-                results.append({
-                    "id":       r['id'],
-                    "url":      r['url'],
-                    "title":    title,
-                    "snippet":  snippet,
-                    "kw_start": kw_start,
-                    "kw_end":   kw_end,
-                    "category": r['category'],
-                    "trust":    r['trust_score'],
-                })
-            con.close()
-            self.send_json({"results":results,"query":q})
 
-        elif p.path == "/api/mirrors":
-            con = db()
-            groups = con.execute('''
-                SELECT mirror_group, COUNT(*) as count,
-                       MIN(title) as title,
-                       MAX(trust_score) as trust,
-                       GROUP_CONCAT(url,"|||") as urls,
-                       GROUP_CONCAT(id,",") as ids
-                FROM sites WHERE mirror_group IS NOT NULL AND noise=0
-                GROUP BY mirror_group ORDER BY count DESC, trust DESC
-            ''').fetchall()
-            con.close()
             self.send_json([{
                 "mirror_group": g2["mirror_group"],
                 "count":  g2["count"],
@@ -929,71 +966,101 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p.path == "/api/stats":
             con = db()
             self.send_json({
-                "crawl_log":  [dict(r) for r in con.execute("SELECT * FROM crawl_log ORDER BY timestamp DESC LIMIT 30").fetchall()],
-                "categories": [dict(r) for r in con.execute("SELECT category,COUNT(*) as count FROM sites WHERE noise=0 GROUP BY category ORDER BY count DESC").fetchall()],
-                "daily":      [dict(r) for r in con.execute('SELECT DATE(timestamp,"unixepoch") as day,COUNT(*) as count FROM sites WHERE noise=0 GROUP BY day ORDER BY day DESC LIMIT 30').fetchall()],
-                "mirrors":    con.execute("SELECT COUNT(DISTINCT mirror_group) FROM sites WHERE mirror_group IS NOT NULL").fetchone()[0],
-                "total":      con.execute("SELECT COUNT(*) FROM sites WHERE noise=0").fetchone()[0],
-                "noise":      con.execute("SELECT COUNT(*) FROM sites WHERE noise=1").fetchone()[0],
-                "recrawl":    con.execute("SELECT COUNT(*) FROM recrawl_queue").fetchone()[0],
-                "due":        con.execute("SELECT COUNT(*) FROM recrawl_queue WHERE next_crawl<=?",(int(time.time()),)).fetchone()[0],
-                "avg_trust":  con.execute("SELECT AVG(trust_score) FROM sites WHERE noise=0").fetchone()[0] or 0,
+                "leaks":      con.execute("SELECT COUNT(*) FROM leaks").fetchone()[0],
+                "tg_total":   con.execute("SELECT COUNT(*) FROM telegram_messages").fetchone()[0],
+                "tg_leaks":   con.execute("SELECT COUNT(*) FROM telegram_messages WHERE has_leak=1").fetchone()[0],
+                "channels":   con.execute("SELECT COUNT(*) FROM telegram_channels WHERE joined=1").fetchone()[0] if table_exists(con,"telegram_channels") else 0,
+                "archives":   con.execute("SELECT COUNT(*) FROM leak_archives").fetchone()[0] if table_exists(con,"leak_archives") else 0,
+                "iocs":       con.execute("SELECT COUNT(*) FROM iocs").fetchone()[0] if table_exists(con,"iocs") else 0,
             })
             con.close()
 
-        elif p.path == "/api/activity":
-            since = int(g("since","0"))
-            self.send_json({"lines":crawl_activity[since:],"total":len(crawl_activity)})
 
-        elif p.path == "/api/files":
-            q=g("q"); ext=g("ext"); page=int(g("page","1")); per_page=50; offset=(page-1)*per_page
-            con=db(); where2,params2=[],[]
-            if ext: where2.append("extension=?"); params2.append(ext)
-            if q:   where2.append("url LIKE ?"); params2.append(f"%{q}%")
-            w2    = ("WHERE "+" AND ".join(where2)) if where2 else ""
-            total = con.execute("SELECT COUNT(*) FROM file_links "+w2,params2).fetchone()[0]
-            rows  = con.execute("SELECT f.*,s.title as site_title FROM file_links f LEFT JOIN sites s ON s.id=f.site_id "+w2+" ORDER BY f.timestamp DESC LIMIT ? OFFSET ?",params2+[per_page,offset]).fetchall()
-            exts  = con.execute("SELECT extension,COUNT(*) as c FROM file_links GROUP BY extension ORDER BY c DESC").fetchall()
-            con.close()
-            self.send_json({"files":[dict(r) for r in rows],"total":total,"ext_counts":[dict(r) for r in exts]})
 
-        elif p.path == "/api/recrawl":
-            action=g("action","list"); con=db()
-            if action=="add":
-                sid=int(g("id","0")); hours=int(g("hours","24"))
-                site=con.execute("SELECT url FROM sites WHERE id=?",(sid,)).fetchone()
-                if site:
-                    now=int(time.time())
-                    con.execute("INSERT OR REPLACE INTO recrawl_queue (site_id,url,interval_h,last_crawled,next_crawl) VALUES(?,?,?,?,?)",(sid,site["url"],hours,now,now+hours*3600))
-                    con.commit(); self.send_json({"ok":True})
-                else: self.send_json({"ok":False})
-            elif action=="remove":
-                sid=int(g("id","0"))
-                con.execute("DELETE FROM recrawl_queue WHERE site_id=?",(sid,))
-                con.commit(); self.send_json({"ok":True})
-            elif action=="run_due":
-                n = run_recrawl_due()
-                self.send_json({"updated":n})
-            else:
-                rows=con.execute("SELECT r.*,s.title,s.trust_score,s.category,s.uptime_count,s.downtime_count FROM recrawl_queue r JOIN sites s ON s.id=r.site_id ORDER BY r.next_crawl ASC").fetchall()
-                due=con.execute("SELECT COUNT(*) FROM recrawl_queue WHERE next_crawl<=?",(int(time.time()),)).fetchone()[0]
-                self.send_json({"queue":[dict(r) for r in rows],"due":due})
-            con.close()
+        elif p.path == "/api/archive_import/create":
+            ensure_leak_archive_tables()
+            download_url = g("download_url","").strip()
+            victim_name = g("victim_name","").strip()
+            actor = g("actor","").strip() or "unknown"
+            leak_name = g("leak_name","").strip()
+            source_type = g("source_type","archive").strip() or "archive"
+            if not download_url:
+                self.send_json({"ok": False, "reason": "Missing download_url"}, 400)
+                return
+            con = db()
+            try:
+                cur = con.execute("""
+                    INSERT INTO leak_archives
+                    (download_url, victim_name, actor, leak_name, source_type, status)
+                    VALUES (?, ?, ?, ?, ?, 'queued')
+                """, (download_url, victim_name, actor, leak_name, source_type))
+                job_id = cur.lastrowid
+                con.commit()
+                worker_res = start_leak_archive_worker(job_id)
+                if not worker_res.get("ok"):
+                    con.execute("UPDATE leak_archives SET status='worker_missing', error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                                (worker_res.get("reason"), job_id))
+                    con.commit()
+                    self.send_json({"ok": False, "job_id": job_id, "reason": worker_res.get("reason")}, 500)
+                    return
+                self.send_json({"ok": True, "job_id": job_id})
+            except Exception as e:
+                self.send_json({"ok": False, "reason": str(e)}, 500)
+            finally:
+                con.close()
 
-        elif p.path == "/api/languages":
-            con=db()
-            rows=con.execute("SELECT language,COUNT(*) as count FROM sites WHERE noise=0 AND language!='unknown' GROUP BY language ORDER BY count DESC").fetchall()
-            con.close()
-            self.send_json([dict(r) for r in rows])
+        elif p.path == "/api/archive_import/jobs":
+            ensure_leak_archive_tables()
+            con = db()
+            try:
+                rows = con.execute("""
+                    SELECT *
+                    FROM leak_archives
+                    ORDER BY id DESC
+                    LIMIT 100
+                """).fetchall()
+                self.send_json({"jobs": [dict(r) for r in rows]})
+            except Exception as e:
+                self.send_json({"jobs": [], "error": str(e)}, 500)
+            finally:
+                con.close()
 
-        elif p.path == "/api/network":
-            con=db()
-            nodes=con.execute("SELECT category as id,COUNT(*) as count FROM sites WHERE noise=0 GROUP BY category").fetchall()
-            edges=con.execute('''SELECT s1.category as source_cat,s2.category as target_cat,COUNT(*) as weight
-                FROM sites s1 JOIN sites s2 ON s1.mirror_group=s2.mirror_group AND s1.id!=s2.id
-                WHERE s1.noise=0 AND s2.noise=0 GROUP BY source_cat,target_cat LIMIT 200''').fetchall()
-            con.close()
-            self.send_json({"nodes":[dict(r) for r in nodes],"edges":[dict(r) for r in edges]})
+        elif p.path == "/api/archive_import/files":
+            ensure_leak_archive_tables()
+            archive_id = int(g("id","0") or 0)
+            con = db()
+            try:
+                rows = con.execute("""
+                    SELECT *
+                    FROM leak_archive_files
+                    WHERE archive_id=?
+                    ORDER BY score DESC, size_bytes DESC
+                    LIMIT 300
+                """, (archive_id,)).fetchall()
+                self.send_json({"files": [dict(r) for r in rows]})
+            except Exception as e:
+                self.send_json({"files": [], "error": str(e)}, 500)
+            finally:
+                con.close()
+
+        elif p.path == "/api/archive_import/run":
+            ensure_leak_archive_tables()
+            job_id = int(g("id","0") or 0)
+            if not job_id:
+                self.send_json({"ok": False, "reason": "Missing id"}, 400)
+                return
+            con = db()
+            try:
+                con.execute("UPDATE leak_archives SET status='queued', error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?", (job_id,))
+                con.commit()
+                worker_res = start_leak_archive_worker(job_id)
+                self.send_json({"ok": worker_res.get("ok", False), "reason": worker_res.get("reason")})
+            finally:
+                con.close()
+
+
+
+
 
         elif p.path=="/api/bookmark":
             sid=int(g("id","0")); val=int(g("val","1")); con=db()
@@ -1026,35 +1093,136 @@ class Handler(http.server.BaseHTTPRequestHandler):
             view = g("view","leaks")  # leaks|all|channels
             q    = g("q")
             page = int(g("page","1")); per_page=50; offset=(page-1)*per_page
+            actor = g("actor")
+            threat = g("threat")
+            ttp = g("ttp")
+            ioc_type = g("ioc_type")
+            source_tier = g("source_tier")
+            min_conf = int(g("min_conf","0") or 0)
+            days = int(g("days","0") or 0)
+            hide_dupes = g("hide_dupes","0") == "1"
             con  = db()
-            if view == "channels":
-                rows = con.execute(
-                    "SELECT * FROM telegram_channels ORDER BY message_count DESC LIMIT 200"
-                ).fetchall()
-                self.send_json({"channels":[dict(r) for r in rows]})
-            elif view == "leaks":
-                where = "WHERE has_leak=1"
+            try:
+                if view == "channels":
+                    where, params = [], []
+                    if q:
+                        where.append("(url LIKE ? OR name LIKE ? OR channel_type LIKE ?)")
+                        params.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
+                    if source_tier:
+                        where.append("COALESCE(source_tier,'unknown')=?")
+                        params.append(source_tier)
+                    w = ("WHERE " + " AND ".join(where)) if where else ""
+                    rows = con.execute(
+                        f"SELECT * FROM telegram_channels {w} ORDER BY message_count DESC LIMIT 200", params
+                    ).fetchall()
+                    self.send_json({"channels":[dict(r) for r in rows]})
+                    return
+
+                muted_sub = "SELECT channel_id FROM telegram_channels WHERE active=0 AND channel_id IS NOT NULL"
+                where = [f"channel_id NOT IN ({muted_sub})"]
                 params = []
+                if view == "leaks":
+                    where.append("has_leak=1")
                 if q:
-                    where += " AND text LIKE ?"
-                    params.append(f"%{q}%")
-                total = con.execute(f"SELECT COUNT(*) FROM telegram_messages {where}",params).fetchone()[0]
+                    where.append("(text LIKE ? OR channel_name LIKE ?)")
+                    params.extend([f"%{q}%", f"%{q}%"])
+                if min_conf > 0:
+                    where.append("confidence>=?")
+                    params.append(min_conf)
+                if days > 0:
+                    where.append("timestamp>=?")
+                    params.append(int(time.time()) - days * 86400)
+                if hide_dupes and column_exists(con, 'telegram_messages', 'is_duplicate'):
+                    where.append("COALESCE(is_duplicate,0)=0")
+                if source_tier:
+                    where.append("EXISTS (SELECT 1 FROM telegram_channels tc WHERE tc.channel_id=telegram_messages.channel_id AND COALESCE(tc.source_tier,'unknown')=?)")
+                    params.append(source_tier)
+
+                # Read-only intelligence filters. If enrichment tables do not exist yet,
+                # the filters safely return no matches instead of breaking the Telegram tab.
+                if actor:
+                    if table_exists(con, 'msg_tags'):
+                        where.append("EXISTS (SELECT 1 FROM msg_tags mt WHERE mt.msg_id=telegram_messages.id AND mt.tag_type='actor' AND mt.tag_value=?)")
+                        params.append(actor)
+                    else:
+                        where.append("0")
+                if threat:
+                    if table_exists(con, 'msg_tags'):
+                        where.append("EXISTS (SELECT 1 FROM msg_tags mt WHERE mt.msg_id=telegram_messages.id AND mt.tag_type='threat_type' AND mt.tag_value=?)")
+                        params.append(threat)
+                    else:
+                        where.append("0")
+                if ttp:
+                    if table_exists(con, 'msg_tags'):
+                        where.append("EXISTS (SELECT 1 FROM msg_tags mt WHERE mt.msg_id=telegram_messages.id AND mt.tag_type='ttp' AND mt.tag_value=?)")
+                        params.append(ttp)
+                    else:
+                        where.append("0")
+                if ioc_type:
+                    if table_exists(con, 'ioc_links') and table_exists(con, 'iocs'):
+                        where.append("EXISTS (SELECT 1 FROM ioc_links il JOIN iocs i ON i.id=il.ioc_id WHERE il.msg_id=telegram_messages.id AND i.type=?)")
+                        params.append(ioc_type)
+                    else:
+                        where.append("0")
+
+                w = "WHERE " + " AND ".join(where)
+                total = con.execute(f"SELECT COUNT(*) FROM telegram_messages {w}",params).fetchone()[0]
                 rows  = con.execute(
-                    f"SELECT * FROM telegram_messages {where} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                    f"SELECT * FROM telegram_messages {w} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
                     params+[per_page,offset]).fetchall()
-                self.send_json({"messages":[dict(r) for r in rows],"total":total})
-            else:
-                where = "WHERE 1=1"
-                params = []
-                if q:
-                    where += " AND text LIKE ?"
-                    params.append(f"%{q}%")
-                total = con.execute(f"SELECT COUNT(*) FROM telegram_messages {where}",params).fetchone()[0]
-                rows  = con.execute(
-                    f"SELECT * FROM telegram_messages {where} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-                    params+[per_page,offset]).fetchall()
-                self.send_json({"messages":[dict(r) for r in rows],"total":total})
-            con.close()
+                self.send_json({"messages":attach_telegram_intel(con, rows),"total":total})
+            finally:
+                con.close()
+
+        elif p.path == "/api/telegram/filter_options":
+            con = db()
+            try:
+                actors = []
+                threats = []
+                ttps = []
+                ioc_types = []
+                if table_exists(con, 'msg_tags'):
+                    actors = [r['tag_value'] for r in con.execute(
+                        "SELECT tag_value, COUNT(*) c FROM msg_tags WHERE tag_type='actor' GROUP BY tag_value ORDER BY c DESC, tag_value LIMIT 100"
+                    ).fetchall()]
+                    threats = [r['tag_value'] for r in con.execute(
+                        "SELECT tag_value, COUNT(*) c FROM msg_tags WHERE tag_type='threat_type' GROUP BY tag_value ORDER BY c DESC, tag_value LIMIT 100"
+                    ).fetchall()]
+                    ttps = [r['tag_value'] for r in con.execute(
+                        "SELECT tag_value, COUNT(*) c FROM msg_tags WHERE tag_type='ttp' GROUP BY tag_value ORDER BY c DESC, tag_value LIMIT 100"
+                    ).fetchall()]
+                if table_exists(con, 'iocs'):
+                    ioc_types = [r['type'] for r in con.execute(
+                        "SELECT type, COUNT(*) c FROM iocs GROUP BY type ORDER BY c DESC, type LIMIT 50"
+                    ).fetchall()]
+                tiers = [r['source_tier'] for r in con.execute(
+                    "SELECT COALESCE(source_tier,'unknown') AS source_tier, COUNT(*) c FROM telegram_channels GROUP BY COALESCE(source_tier,'unknown') ORDER BY c DESC"
+                ).fetchall()]
+                self.send_json({"actors":actors,"threats":threats,"ttps":ttps,"ioc_types":ioc_types,"source_tiers":tiers})
+            except Exception as e:
+                self.send_json({"actors":[],"threats":[],"ttps":[],"ioc_types":[],"source_tiers":["unknown"]})
+            finally:
+                con.close()
+
+        elif p.path == "/api/telegram/source_tier":
+            url = g("url")
+            tier = g("tier","unknown")
+            allowed = {'actor_owned','affiliate','broker','intel_source','news_repost','random','spam','unknown'}
+            if tier not in allowed:
+                self.send_json({"ok": False, "reason": "Invalid source tier"}, 400)
+                return
+            if not url:
+                self.send_json({"ok": False, "reason": "Missing channel URL"}, 400)
+                return
+            con = db()
+            try:
+                con.execute("UPDATE telegram_channels SET source_tier=? WHERE url=?", (tier, url))
+                con.commit()
+                self.send_json({"ok": True, "source_tier": tier})
+            except Exception as e:
+                self.send_json({"ok": False, "reason": str(e)}, 500)
+            finally:
+                con.close()
 
         elif p.path == "/api/telegram/stats":
             try:
@@ -1069,27 +1237,113 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except:
                 self.send_json({"total_messages":0,"leak_messages":0,"joined_channels":0,"discovered_channels":0})
 
-        elif p.path == "/api/pastes":
-            q        = g("q"); view=g("view","leaks")
-            page     = int(g("page","1")); per_page=50; offset=(page-1)*per_page
-            con      = db()
+        elif p.path == "/api/intel/dashboard":
+            days = int(g("days","7") or 0)
+            since = int(time.time()) - days * 86400 if days > 0 else 0
+            con = db()
             try:
-                where, params = [], []
-                if view == "leaks": where.append("has_leak=1")
-                if q: where.append("content LIKE ?"); params.append(f"%{q}%")
-                w     = ("WHERE "+" AND ".join(where)) if where else ""
-                total = con.execute(f"SELECT COUNT(*) FROM paste_items {w}",params).fetchone()[0]
-                rows  = con.execute(
-                    f"SELECT * FROM paste_items {w} ORDER BY first_seen DESC LIMIT ? OFFSET ?",
-                    params+[per_page,offset]).fetchall()
-                sites = con.execute(
-                    "SELECT site_name, COUNT(*) as c FROM paste_items GROUP BY site_name ORDER BY c DESC"
-                ).fetchall()
-                self.send_json({"pastes":[dict(r) for r in rows],"total":total,
-                               "sites":[dict(r) for r in sites]})
-            except:
-                self.send_json({"pastes":[],"total":0,"sites":[]})
-            con.close()
+                total_messages = con.execute("SELECT COUNT(*) FROM telegram_messages").fetchone()[0] if table_exists(con, 'telegram_messages') else 0
+                processed = 0
+                queue = 0
+                dupes = 0
+                if table_exists(con, 'telegram_messages'):
+                    if column_exists(con, 'telegram_messages', 'intel_processed'):
+                        processed = con.execute("SELECT COUNT(*) FROM telegram_messages WHERE intel_processed=1").fetchone()[0]
+                        queue = con.execute("SELECT COUNT(*) FROM telegram_messages WHERE intel_processed=0").fetchone()[0]
+                    if column_exists(con, 'telegram_messages', 'is_duplicate'):
+                        dupes = con.execute("SELECT COUNT(*) FROM telegram_messages WHERE is_duplicate=1").fetchone()[0]
+
+                ioc_count = con.execute("SELECT COUNT(*) FROM iocs").fetchone()[0] if table_exists(con, 'iocs') else 0
+                tag_count = con.execute("SELECT COUNT(*) FROM msg_tags").fetchone()[0] if table_exists(con, 'msg_tags') else 0
+
+                def qrows(sql, params=()):
+                    try:
+                        return [dict(r) for r in con.execute(sql, params).fetchall()]
+                    except Exception:
+                        return []
+
+                time_clause = ""
+                time_params = []
+                if since:
+                    time_clause = " AND tm.timestamp>=?"
+                    time_params = [since]
+
+                top_actors = []
+                threat_types = []
+                top_ttps = []
+                if table_exists(con, 'msg_tags') and table_exists(con, 'telegram_messages'):
+                    conf_expr = "COALESCE(mt.confidence,50)" if column_exists(con, 'msg_tags', 'confidence') else "50"
+                    top_actors = qrows(
+                        "SELECT mt.tag_value AS name, COUNT(*) AS count, ROUND(AVG("+conf_expr+")) AS avg_conf "
+                        "FROM msg_tags mt JOIN telegram_messages tm ON tm.id=mt.msg_id "
+                        "WHERE mt.tag_type='actor'" + time_clause +
+                        " GROUP BY mt.tag_value ORDER BY count DESC LIMIT 10", time_params)
+                    threat_types = qrows(
+                        "SELECT mt.tag_value AS name, COUNT(*) AS count, ROUND(AVG("+conf_expr+")) AS avg_conf "
+                        "FROM msg_tags mt JOIN telegram_messages tm ON tm.id=mt.msg_id "
+                        "WHERE mt.tag_type='threat_type'" + time_clause +
+                        " GROUP BY mt.tag_value ORDER BY count DESC LIMIT 10", time_params)
+                    top_ttps = qrows(
+                        "SELECT mt.tag_value AS name, COUNT(*) AS count, ROUND(AVG("+conf_expr+")) AS avg_conf "
+                        "FROM msg_tags mt JOIN telegram_messages tm ON tm.id=mt.msg_id "
+                        "WHERE mt.tag_type='ttp'" + time_clause +
+                        " GROUP BY mt.tag_value ORDER BY count DESC LIMIT 10", time_params)
+
+                hot_iocs = []
+                top_cves = []
+                if table_exists(con, 'iocs'):
+                    qcol = 'COALESCE(quality,50)' if column_exists(con, 'iocs', 'quality') else '50'
+                    hot_iocs = qrows(
+                        f"SELECT type,value,times_seen,{qcol} AS quality FROM iocs "
+                        "WHERE type NOT IN ('domains','emails','cves','ips') "
+                        "AND LOWER(value) NOT IN ('t.me','telegram.me','github.com','check-host.net') "
+                        "ORDER BY times_seen DESC, quality DESC LIMIT 12")
+                    top_cves = qrows(
+                        f"SELECT value,times_seen,{qcol} AS quality FROM iocs WHERE type='cve' "
+                        "ORDER BY times_seen DESC, quality DESC LIMIT 10")
+
+                top_channels = []
+                if table_exists(con, 'telegram_messages'):
+                    tier_select = "COALESCE(tc.source_tier,'unknown')" if (table_exists(con, 'telegram_channels') and column_exists(con, 'telegram_channels', 'source_tier')) else "'unknown'"
+                    join_chan = "LEFT JOIN telegram_channels tc ON tc.channel_id=tm.channel_id" if table_exists(con, 'telegram_channels') else ""
+                    where_time = "WHERE tm.timestamp>=?" if since else ""
+                    top_channels = qrows(
+                        f"SELECT tm.channel_name AS name, tm.channel_id AS channel_id, {tier_select} AS source_tier, "
+                        "COUNT(*) AS messages, SUM(CASE WHEN tm.has_leak=1 THEN 1 ELSE 0 END) AS leaks, MAX(tm.timestamp) AS last_seen "
+                        f"FROM telegram_messages tm {join_chan} {where_time} "
+                        "GROUP BY tm.channel_id, tm.channel_name ORDER BY leaks DESC, messages DESC LIMIT 10", time_params)
+
+                recent_rows = []
+                if table_exists(con, 'telegram_messages'):
+                    where = []
+                    params = []
+                    if since:
+                        where.append('timestamp>=?'); params.append(since)
+                    where.append('has_leak=1')
+                    w = 'WHERE ' + ' AND '.join(where) if where else ''
+                    recent_rows = con.execute(
+                        f"SELECT * FROM telegram_messages {w} ORDER BY confidence DESC, timestamp DESC LIMIT 10",
+                        params).fetchall()
+                    recent_rows = attach_telegram_intel(con, recent_rows)
+
+                self.send_json({
+                    "summary": {
+                        "messages": total_messages, "processed": processed, "queue": queue,
+                        "duplicates": dupes, "iocs": ioc_count, "tags": tag_count
+                    },
+                    "top_actors": top_actors,
+                    "threat_types": threat_types,
+                    "top_ttps": top_ttps,
+                    "hot_iocs": hot_iocs,
+                    "top_cves": top_cves,
+                    "top_channels": top_channels,
+                    "recent_messages": recent_rows
+                })
+            except Exception as e:
+                self.send_json({"summary":{"messages":0,"processed":0,"queue":0,"duplicates":0,"iocs":0,"tags":0},"error":str(e)})
+            finally:
+                con.close()
+
 
         elif p.path == "/api/purge/csam":
             # Remove any CSAM sites that slipped through filters
@@ -1111,40 +1365,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con.commit(); con.close()
             self.send_json({"ok":True,"removed":removed})
 
-        elif p.path == "/api/stealer/stats":
-            try:
-                con = db()
-                total_logs  = con.execute("SELECT COUNT(*) FROM stealer_logs").fetchone()[0]
-                total_creds = con.execute("SELECT COUNT(*) FROM stealer_credentials").fetchone()[0]
-                types  = con.execute("SELECT log_type,COUNT(*) as c FROM stealer_logs GROUP BY log_type ORDER BY c DESC").fetchall()
-                recent = con.execute("SELECT * FROM stealer_logs ORDER BY parsed_at DESC LIMIT 5").fetchall()
-                con.close()
-                self.send_json({"total_logs":total_logs,"total_creds":total_creds,
-                               "types":[dict(r) for r in types],"recent":[dict(r) for r in recent]})
-            except:
-                self.send_json({"total_logs":0,"total_creds":0,"types":[],"recent":[]})
 
-        elif p.path == "/api/stealer/search":
-            q    = g("q","").strip()
-            page = int(g("page","1")); per_page=50; offset=(page-1)*per_page
-            if not q or len(q) < 2:
-                self.send_json({"results":[],"total":0}); return
-            try:
-                con  = db()
-                rows = con.execute(
-                    "SELECT c.*,l.log_type,l.filename,l.source "
-                    "FROM stealer_credentials c "
-                    "JOIN stealer_logs l ON l.id=c.log_id "
-                    "WHERE c.username LIKE ? OR c.url LIKE ? "
-                    "ORDER BY c.found_at DESC LIMIT ? OFFSET ?",
-                    (f"%{q}%",f"%{q}%",per_page,offset)).fetchall()
-                total = con.execute(
-                    "SELECT COUNT(*) FROM stealer_credentials WHERE username LIKE ? OR url LIKE ?",
-                    (f"%{q}%",f"%{q}%")).fetchone()[0]
-                con.close()
-                self.send_json({"results":[dict(r) for r in rows],"total":total})
-            except:
-                self.send_json({"results":[],"total":0})
 
         elif p.path == "/webhook/canary":
             # Canarytokens webhook — receives alerts when tokens fire
@@ -1258,6 +1479,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sid=int(g("id","0")); note=g("note",""); con=db()
             con.execute("UPDATE leaks SET notes=? WHERE id=?",(note,sid))
             con.commit(); con.close(); self.send_json({"ok":True})
+
+        elif p.path == "/api/ransomware/groups":
+            import urllib.request as _ur
+            try:
+                req = _ur.Request(
+                    "https://api-pro.ransomware.live/groups",
+                    headers={"accept":"application/json","X-API-KEY":RANSOMWARE_LIVE_API_KEY}
+                )
+                with _ur.urlopen(req, timeout=20) as resp:
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Access-Control-Allow-Origin","*")
+                    self.end_headers()
+                    self.wfile.write(resp.read())
+            except Exception as e:
+                self.send_json({"error": str(e)}, 502)
+
+        elif p.path == "/api/ransomware/correlation":
+            name = g("name","").strip()
+            if not name:
+                self.send_json({"error":"missing name"}, 400); return
+            con = db()
+            try:
+                self.send_json(ransomware_telegram_correlation(con, name))
+            finally:
+                con.close()
+
+        elif p.path == "/api/ransomware/victim_timeline":
+            name = g("group","").strip()
+            victim = g("victim","").strip()
+            domain = g("domain","").strip()
+            published = g("published", "0").strip()
+            if not victim:
+                self.send_json({"error":"missing victim"}, 400); return
+            con = db()
+            try:
+                self.send_json(ransomware_victim_timeline(con, name, victim, domain, published))
+            finally:
+                con.close()
+
+        elif p.path == "/api/ransomware/group":
+            name = g("name","").strip().lower()
+            if not name:
+                self.send_json({"error":"missing name"}, 400); return
+            import urllib.request as _ur
+            try:
+                req = _ur.Request(
+                    f"https://api-pro.ransomware.live/groups/{name}",
+                    headers={"accept":"application/json","X-API-KEY":RANSOMWARE_LIVE_API_KEY}
+                )
+                with _ur.urlopen(req, timeout=20) as resp:
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Access-Control-Allow-Origin","*")
+                    self.end_headers()
+                    self.wfile.write(resp.read())
+            except Exception as e:
+                self.send_json({"error": str(e)}, 502)
+
+
         else:
             self.send_response(404); self.end_headers()
 
@@ -2521,6 +2802,21 @@ body::after {
   color: var(--accent-hi);
 }
 
+/* Telegram sub-tab style — flat underline tabs */
+.tg-sub-tab {
+  border-radius: 0;
+  border-color: transparent;
+  background: transparent;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.tg-sub-tab.on {
+  background: transparent;
+  border-color: transparent;
+  border-bottom: 2px solid var(--accent);
+  color: var(--accent-hi);
+}
+
 /* ── Mirror expand rows ─────────────────────────────────────────────────────── */
 .mirror-row td {
   background: rgba(59,130,246,0.04);
@@ -2580,6 +2876,32 @@ body::after {
 .mirror-url-link a { color: inherit; text-decoration: none; }
 .mirror-url-link a:hover { color: var(--text); }
 
+/* ── Ransomware cards ───────────────────────────────────────────────────────── */
+.rw-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  cursor: pointer;
+  transition:
+    border-color 150ms var(--ease-out),
+    background   150ms var(--ease-out);
+}
+@media (hover: hover) and (pointer: fine) {
+  .rw-card:hover {
+    border-color: var(--red);
+    background: var(--surface2);
+  }
+}
+
+
+.mini-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border:1px solid var(--border);border-radius:999px;font-size:10px;font-weight:700;letter-spacing:.02em;background:rgba(255,255,255,.035);color:var(--text-2);}
+.mini-badge.intel-actor{border-color:rgba(239,68,68,.45);color:var(--red);}
+.mini-badge.intel-threat{border-color:rgba(245,158,11,.45);color:var(--amber);}
+.mini-badge.intel-ttp{border-color:rgba(59,130,246,.45);color:var(--accent-hi);}
+.mini-badge.intel-ioc{border-color:rgba(34,197,94,.45);color:var(--green);}
+.mini-badge.intel-dupe{border-color:rgba(148,163,184,.35);color:var(--text-3);}
+
 </style>
 </head>
 <body>
@@ -2599,29 +2921,21 @@ body::after {
 
   <div class="topbar-stats">
     <div class="stat-pill">
-      <span>Sites</span>
-      <span class="val" id="hTotal">—</span>
-    </div>
-    <div class="stat-pill">
       <span>Leaks</span>
       <span class="val" id="hLeaks" style="color:var(--red);">—</span>
     </div>
     <div class="stat-pill">
-      <span>Mirrors</span>
-      <span class="val" id="hMirrors" style="color:var(--amber);">—</span>
+      <span>TG Messages</span>
+      <span class="val" id="hTgMsg" style="color:var(--accent-hi);">—</span>
     </div>
     <div class="stat-pill">
-      <span>Bookmarked</span>
-      <span class="val" id="hBookmarks">—</span>
+      <span>TG Leaks</span>
+      <span class="val" id="hTgLeak" style="color:var(--amber);">—</span>
     </div>
     <div id="alertBadge"></div>
     <div id="newBadge"></div>
   </div>
 
-  <div class="topbar-actions">
-    <button class="btn primary" id="btnStart" onclick="startCrawl()">▶ Start Crawl</button>
-    <button class="btn danger"  id="btnStop"  onclick="stopCrawl()" disabled>■ Stop</button>
-  </div>
 </header>
 
 <!-- App body -->
@@ -2630,105 +2944,49 @@ body::after {
   <!-- Left nav -->
   <nav class="nav">
     <div class="nav-section-label">Intelligence</div>
-    <div class="nav-item active" onclick="setTab('top')"       id="tab-top">
-      <span class="nav-icon">⭐</span> Top Picks
-    </div>
-    <div class="nav-item" onclick="setTab('leaks')"     id="tab-leaks">
-      <span class="nav-icon">🔓</span> Leaks & Exploits
+    <div class="nav-item" onclick="setTab('leaks')"     id="tab-leaks" class="nav-item active">
+      <span class="nav-icon">&#128274;</span> Leaks & Exploits
     </div>
     <div class="nav-item" onclick="setTab('telegram')"  id="tab-telegram">
-      <span class="nav-icon">📱</span> Telegram
+      <span class="nav-icon">&#128241;</span> Telegram
       <span class="nav-badge blue" id="tgBadge" style="display:none">0</span>
     </div>
-    <div class="nav-item" onclick="setTab('pastes')"    id="tab-pastes">
-      <span class="nav-icon">📋</span> Paste Sites
+    <div class="nav-item" onclick="setTab('intel')" id="tab-intel">
+      <span class="nav-icon">&#129504;</span> Intel Dashboard
     </div>
-    <div class="nav-item" onclick="setTab('stealer')"   id="tab-stealer">
-      <span class="nav-icon">🔑</span> Stealer Logs
+    <div class="nav-item" onclick="setTab('ransomware')" id="tab-ransomware">
+      <span class="nav-icon">&#9760;&#65039;</span> Ransomware Groups
+      <span class="nav-badge" id="rwBadge" style="display:none;background:var(--red);">0</span>
+    </div>
+    <div class="nav-item" onclick="setTab('canaries')" id="tab-canaries">
+      <span class="nav-icon">&#128038;</span> Canary Tokens
     </div>
 
-    <div class="nav-divider"></div>
-    <div class="nav-section-label">Discovery</div>
 
-    <div class="nav-item" onclick="setTab('browse')"    id="tab-browse">
-      <span class="nav-icon">🔍</span> Browse Sites
-    </div>
-    <div class="nav-item" onclick="setTab('mirrors')"   id="tab-mirrors">
-      <span class="nav-icon">🔁</span> Mirrors
-    </div>
-    <div class="nav-item" onclick="setTab('files')"     id="tab-files">
-      <span class="nav-icon">📁</span> File Links
-    </div>
-    <div class="nav-item" onclick="setTab('language')"  id="tab-language">
-      <span class="nav-icon">🌐</span> Languages
-    </div>
 
     <div class="nav-divider"></div>
     <div class="nav-section-label">Management</div>
 
+    <div class="nav-item" onclick="setTab('archiveImport')" id="tab-archiveImport">
+      <span class="nav-icon">&#128230;</span> Archive Import
+    </div>
     <div class="nav-item" onclick="setTab('alerts')"    id="tab-alerts">
-      <span class="nav-icon">🔔</span> Alerts
+      <span class="nav-icon">&#128276;</span> Alerts
       <span class="nav-badge" id="alertNavBadge" style="display:none">0</span>
     </div>
-    <div class="nav-item" onclick="setTab('recrawl')"   id="tab-recrawl">
-      <span class="nav-icon">🔄</span> Re-Crawl
-    </div>
     <div class="nav-item" onclick="setTab('bookmarks')" id="tab-bookmarks">
-      <span class="nav-icon">🔖</span> Bookmarks
+      <span class="nav-icon">&#128278;</span> Bookmarks
     </div>
-    <div class="nav-item" onclick="setTab('noise')"     id="tab-noise">
-      <span class="nav-icon">🗑</span> Filtered
+    <div class="nav-item" onclick="setTab('stats')"     id="tab-stats">
+      <span class="nav-icon">&#128202;</span> Stats
     </div>
   </nav>
 
   <!-- Main -->
   <div class="main">
 
-    <!-- TOP PICKS -->
-    <div class="panel active" id="topPanel">
-      <div class="content-header">
-        <div class="content-title">Top Picks <span class="content-subtitle" id="shown">—</span></div>
-        <div style="margin-left:auto;font-size:12px;color:var(--text-3);">Sorted by trust score</div>
-      </div>
-      <div class="panel-scroll" id="topGrid"></div>
-    </div>
-
-    <!-- BROWSE -->
-    <div class="panel" id="browsePanel">
-      <div class="content-header">
-        <div class="content-title">Browse</div>
-        <div class="search-bar">
-          <input type="text" id="q" placeholder="Search titles, URLs, previews…" oninput="onSearch()">
-        </div>
-        <select class="select" id="sortSel" onchange="load()">
-          <option value="trust">Trust score</option>
-          <option value="score">Keyword match</option>
-          <option value="newest">Newest</option>
-          <option value="alpha">A → Z</option>
-        </select>
-        <button class="filter-btn on" id="groupToggle" onclick="toggleGrouping()" title="Group subpages by host">⊞ Grouped</button>
-        <div class="result-count">showing <span id="browseShown">—</span> / <span id="totalShown">—</span></div>
-      </div>
-      <div class="browse-layout">
-        <div class="cat-sidebar" id="catList"></div>
-        <div style="flex:1;display:flex;flex-direction:column;overflow:hidden;">
-          <div class="panel-scroll" style="padding:0;" id="tableWrap"></div>
-          <div id="pgEl"></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- MIRRORS -->
-    <div class="panel" id="mirrorsPanel">
-      <div class="content-header">
-        <div class="content-title">Mirror Groups</div>
-        <div class="result-count"><span id="mirrorCount">—</span> groups detected</div>
-      </div>
-      <div class="panel-scroll" id="mirrorsContent"></div>
-    </div>
-
     <!-- LEAKS -->
-    <div class="panel" id="leaksPanel">
+    <div class="panel active" id="leaksPanel">
       <div class="content-header">
         <div class="content-title">Leaks & Exploits</div>
         <div class="search-bar">
@@ -2789,33 +3047,109 @@ body::after {
         <div class="result-count"><span id="tgShown">—</span> / <span id="tgTotal">—</span></div>
       </div>
       <div style="display:flex;border-bottom:1px solid var(--border);flex-shrink:0;padding:0 16px;gap:4px;">
-        <button class="filter-btn on" onclick="setTgTab('leaks')"    id="tg-tab-leaks"    style="border-radius:0;border-bottom:2px solid var(--accent);margin-bottom:-1px;">🔓 Leak Hits</button>
-        <button class="filter-btn"    onclick="setTgTab('all')"      id="tg-tab-all"      style="border-radius:0;border-bottom:2px solid transparent;margin-bottom:-1px;">💬 All Messages</button>
-        <button class="filter-btn"    onclick="setTgTab('channels')" id="tg-tab-channels" style="border-radius:0;border-bottom:2px solid transparent;margin-bottom:-1px;">📡 Channels</button>
+        <button class="filter-btn tg-sub-tab on" onclick="setTgTab('leaks')"    id="tg-tab-leaks">&#128276; Leak Hits</button>
+        <button class="filter-btn tg-sub-tab"    onclick="setTgTab('all')"      id="tg-tab-all">&#128172; All Messages</button>
+        <button class="filter-btn tg-sub-tab"    onclick="setTgTab('channels')" id="tg-tab-channels">&#128225; Channels</button>
+      </div>
+      <div id="tgIntelFilters" style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.015);">
+        <select class="select" id="tgActor" onchange="tgPage=1;loadTelegram()"><option value="">All Actors</option></select>
+        <select class="select" id="tgThreat" onchange="tgPage=1;loadTelegram()"><option value="">All Threat Types</option></select>
+        <select class="select" id="tgTtp" onchange="tgPage=1;loadTelegram()"><option value="">All TTPs</option></select>
+        <select class="select" id="tgIoc" onchange="tgPage=1;loadTelegram()"><option value="">All IOC Types</option></select>
+        <select class="select" id="tgSourceTier" onchange="tgPage=1;loadTelegram()">
+          <option value="">All Sources</option>
+          <option value="actor_owned">Actor-owned</option>
+          <option value="affiliate">Affiliate</option>
+          <option value="broker">Broker</option>
+          <option value="intel_source">Intel source</option>
+          <option value="news_repost">News/repost</option>
+          <option value="random">Random</option>
+          <option value="spam">Spam</option>
+          <option value="unknown">Unknown</option>
+        </select>
+        <select class="select" id="tgMinConf" onchange="tgPage=1;loadTelegram()">
+          <option value="0">Any Confidence</option>
+          <option value="35">35%+</option>
+          <option value="50">50%+</option>
+          <option value="70">70%+</option>
+        </select>
+        <select class="select" id="tgDays" onchange="tgPage=1;loadTelegram()">
+          <option value="0">All Time</option>
+          <option value="1">24h</option>
+          <option value="7">7d</option>
+          <option value="30">30d</option>
+        </select>
+        <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-2);white-space:nowrap;">
+          <input type="checkbox" id="tgHideDupes" onchange="tgPage=1;loadTelegram()"> Hide duplicates
+        </label>
+        <button class="filter-btn" onclick="resetTelegramFilters()">Reset</button>
       </div>
       <div class="panel-scroll" style="padding:0;" id="tgTableWrap"></div>
       <div id="tgPgEl"></div>
     </div>
 
-    <!-- PASTES -->
-    <div class="panel" id="pastesPanel">
+    <!-- INTEL DASHBOARD -->
+    <div class="panel" id="intelPanel">
       <div class="content-header">
-        <div class="content-title">Paste Sites</div>
-        <div class="search-bar">
-          <input type="text" id="pasteQ" placeholder="Search paste content…" oninput="loadPastes()">
+        <div class="content-title">&#129504; Intel Dashboard</div>
+        <div style="display:flex;gap:8px;margin-left:8px;">
+          <div class="stat-pill"><span>IOCs</span><span class="val" id="intelIocs" style="color:var(--accent-hi);">—</span></div>
+          <div class="stat-pill"><span>Tags</span><span class="val" id="intelTags">—</span></div>
+          <div class="stat-pill"><span>Duplicates</span><span class="val" id="intelDupes" style="color:var(--amber);">—</span></div>
+          <div class="stat-pill"><span>Queue</span><span class="val" id="intelQueue" style="color:var(--red);">—</span></div>
         </div>
-        <select class="select" id="pasteView" onchange="loadPastes()">
-          <option value="leaks">Leak Hits Only</option>
-          <option value="all">All Pastes</option>
+        <select class="select" id="intelDays" onchange="loadIntelDashboard()" style="margin-left:auto;">
+          <option value="1">24h</option>
+          <option value="7" selected>7d</option>
+          <option value="30">30d</option>
+          <option value="0">All Time</option>
         </select>
-        <div class="result-count"><span id="pasteShown">—</span> / <span id="pasteTotal">—</span></div>
+        <button class="filter-btn" onclick="loadIntelDashboard(true)">&#8635; Refresh</button>
       </div>
-      <div id="pasteSites" style="display:flex;gap:6px;padding:8px 20px;border-bottom:1px solid var(--border);flex-wrap:wrap;flex-shrink:0;"></div>
-      <div class="panel-scroll" style="padding:0;" id="pasteTableWrap"></div>
-      <div id="pastePgEl"></div>
+      <div style="display:flex;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border);background:rgba(255,255,255,.015);flex-wrap:wrap;">
+        <button class="filter-btn active" id="intelTabOverview" onclick="showIntelSubTab('overview')">Overview</button>
+        <button class="filter-btn" id="intelTabActors" onclick="showIntelSubTab('actors')">Actors &amp; Threats</button>
+        <button class="filter-btn" id="intelTabIocs" onclick="showIntelSubTab('iocs')">IOCs &amp; CVEs</button>
+        <button class="filter-btn" id="intelTabChannels" onclick="showIntelSubTab('channels')">Channels</button>
+        <button class="filter-btn" id="intelTabRecent" onclick="showIntelSubTab('recent')">Recent Messages</button>
+      </div>
+      <div class="panel-scroll" id="intelDashWrap"></div>
     </div>
 
-    <!-- STEALER LOGS -->
+        <!-- RANSOMWARE GROUPS -->
+    <div class="panel" id="ransomwarePanel">
+      <div class="content-header">
+        <div class="content-title">&#9760;&#65039; Ransomware Groups</div>
+        <div style="display:flex;gap:6px;margin-left:8px;">
+          <div class="stat-pill">
+            <span>Groups</span>
+            <span class="val" id="rwGangCount" style="color:var(--red);">—</span>
+          </div>
+          <div class="stat-pill">
+            <span>Total Victims</span>
+            <span class="val" id="rwVictimCount" style="color:var(--amber);">—</span>
+          </div>
+          <div class="stat-pill">
+            <span>Active</span>
+            <span class="val" id="rwActiveCount" style="color:var(--green);">—</span>
+          </div>
+        </div>
+        <div class="search-bar" style="margin-left:8px;">
+          <input type="text" id="rwQ" placeholder="Search groups…" oninput="filterRansomware()">
+        </div>
+        <select class="select" id="rwStatus" onchange="filterRansomware()">
+          <option value="">All Status</option>
+          <option value="Active">Active</option>
+          <option value="Inactive">Inactive</option>
+          <option value="Unknown">Unknown</option>
+        </select>
+        <button class="btn" onclick="loadRansomware(true)" style="margin-left:4px;" title="Refresh from API">↻ Refresh</button>
+        <div class="result-count"><span id="rwShown">—</span></div>
+      </div>
+      <div class="panel-scroll" id="rwContent" style="padding:0;position:relative;"></div>
+    </div>
+
+<!-- ARCHIVE IMPORT is next -->
     <div class="panel" id="stealerPanel">
       <div class="content-header">
         <div class="content-title">Stealer Logs</div>
@@ -2841,18 +3175,47 @@ body::after {
       </div>
     </div>
 
-    <!-- FILES -->
-    <div class="panel" id="filesPanel">
+
+    <!-- ARCHIVE IMPORT -->
+    <div class="panel" id="archiveImportPanel">
       <div class="content-header">
-        <div class="content-title">File Links</div>
-        <div class="search-bar">
-          <input type="text" id="fileQ" placeholder="Search file URLs…" oninput="loadFiles()">
-        </div>
-        <select class="select" id="fileExt" onchange="loadFiles()"><option value="">All types</option></select>
-        <div class="result-count"><span id="fileShown">—</span> / <span id="fileTotal">—</span></div>
+        <div class="content-title">Archive Import</div>
+        <div class="result-count">Downloader → ClamAV → Extract → ClamAV → Import</div>
+        <button class="btn" onclick="loadArchiveImport()" style="margin-left:auto;">↻ Refresh</button>
       </div>
-      <div class="panel-scroll" style="padding:0;" id="fileTableWrap"></div>
-      <div id="filePgEl"></div>
+      <div style="padding:12px 20px;border-bottom:1px solid var(--border);background:rgba(59,130,246,0.03);flex-shrink:0;">
+        <div style="font-size:11px;font-weight:600;color:var(--accent-hi);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;">Queue New Archive</div>
+        <div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 140px auto;gap:8px;align-items:end;">
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">Download URL</div>
+            <input class="select" style="width:100%;" id="archiveUrl" placeholder="https://example.com/file.zip">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">Victim</div>
+            <input class="select" style="width:100%;" id="archiveVictim" placeholder="victim">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">Actor</div>
+            <input class="select" style="width:100%;" id="archiveActor" placeholder="unknown">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">Leak Name</div>
+            <input class="select" style="width:100%;" id="archiveLeakName" placeholder="source/leak">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">Type</div>
+            <select class="select" style="width:100%;" id="archiveSourceType">
+              <option value="archive">archive</option>
+              <option value="csv">csv</option>
+              <option value="txt">txt</option>
+              <option value="json">json</option>
+              <option value="sql">sql</option>
+            </select>
+          </div>
+          <button class="btn primary" onclick="queueArchiveImport()">Queue + Start</button>
+        </div>
+      </div>
+      <div class="panel-scroll" style="padding:0;" id="archiveImportWrap"></div>
     </div>
 
     <!-- ALERTS -->
@@ -2874,20 +3237,7 @@ body::after {
       </div>
     </div>
 
-    <!-- RECRAWL -->
-    <div class="panel" id="recrawlPanel">
-      <div class="content-header">
-        <div class="content-title">Re-Crawl Schedule</div>
-        <button class="btn primary" onclick="runDueNow()">▶ Run Due Now</button>
-        <span id="rcDueBadge" style="margin-left:6px;"></span>
-      </div>
-      <div class="panel-scroll">
-        <div style="font-size:12px;color:var(--text-3);margin-bottom:16px;">Sites scoring ≥10 are auto-queued. Background re-crawls run every 30 minutes.</div>
-        <div id="recrawlList"></div>
-      </div>
-    </div>
-
-    <!-- LANGUAGE -->
+    <!-- BOOKMARKS next -->
     <div class="panel" id="languagePanel">
       <div class="content-header"><div class="content-title">Languages</div></div>
       <div class="panel-scroll">
@@ -2909,18 +3259,6 @@ body::after {
       </div>
       <div class="panel-scroll" style="padding:0;" id="bmTableWrap"></div>
       <div id="bmPgEl"></div>
-    </div>
-
-    <!-- NOISE/FILTERED -->
-    <div class="panel" id="noisePanel">
-      <div class="content-header">
-        <div class="content-title">Filtered Sites</div>
-        <div class="search-bar">
-          <input type="text" id="noiseQ" placeholder="Search filtered…" oninput="onSearch()">
-        </div>
-      </div>
-      <div class="panel-scroll" style="padding:0;" id="noiseTableWrap"></div>
-      <div id="noisePgEl"></div>
     </div>
 
     <!-- Activity log -->
@@ -2956,6 +3294,14 @@ body::after {
         <div id="canaryPgEl"></div>
       </div>
 
+    <!-- STATS -->
+    <div class="panel" id="statsPanel">
+      <div class="content-header">
+        <div class="content-title">Stats</div>
+      </div>
+      <div class="panel-scroll" style="padding:20px;"></div>
+    </div>
+
   </div><!-- /main -->
 </div><!-- /app-body -->
 
@@ -2979,7 +3325,6 @@ body::after {
       <button class="btn primary" onclick="saveNote()">Save Note</button>
       <button class="btn" id="drBm" onclick="toggleDrawerBm()">🔖 Bookmark</button>
       <button class="btn" id="drRv" onclick="toggleDrawerRv()">✓ Reviewed</button>
-      <button class="btn" id="drRcBtn" onclick="scheduleRecrawl()">🔄 Schedule</button>
       <button class="btn" id="drDelBtn" onclick="deleteSite()" style="border-color:var(--red);color:var(--red);margin-top:8px;width:100%;">🗑 Delete Site</button>
     </div>
   </div>
@@ -3051,6 +3396,7 @@ let _activitySince=0;
 let _pollInterval=3000;  // starts at 3s, slows to 15s when idle
 
 function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function jsEsc(s){return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/\n/g,' ');}
 function ts(){return`[${new Date().toLocaleTimeString()}] `;}
 
 // ── Tab ────────────────────────────────────────────────────────────────────────
@@ -3064,8 +3410,8 @@ async function setTab(tab){
 
   // Hide all panels
   const panels = ['topPanel','browsePanel','mirrorsPanel','leaksPanel','alertsPanel',
-    'filesPanel','recrawlPanel','languagePanel',
-    'telegramPanel','pastesPanel','stealerPanel','bookmarksPanel','noisePanel','canariesPanel'];
+      'filesPanel','recrawlPanel','languagePanel',
+      'telegramPanel','intelPanel','pastesPanel','stealerPanel','ransomwarePanel','archiveImportPanel','bookmarksPanel','noisePanel','canariesPanel'];
   panels.forEach(id=>{ const el=document.getElementById(id); if(el){ el.classList.remove('active'); }});
 
   const showPanel = (id) => { const el=document.getElementById(id); if(el) el.classList.add('active'); };
@@ -3076,6 +3422,7 @@ async function setTab(tab){
   else if(tab==='noise')     { showPanel('noisePanel');     load(); }
   else if(tab==='mirrors')   { showPanel('mirrorsPanel');   loadMirrors(); }
   else if(tab==='leaks')     { showPanel('leaksPanel');     leakPage=1; loadLeaks(); }
+  else if(tab==='archiveImport') { showPanel('archiveImportPanel'); loadArchiveImport(); }
   else if(tab==='alerts')    { showPanel('alertsPanel');    loadAlerts(); }
   else if(tab==='files')     { showPanel('filesPanel');     loadFiles(); }
   else if(tab==='recrawl')   { showPanel('recrawlPanel');   loadRecrawl(); }
@@ -3083,7 +3430,11 @@ async function setTab(tab){
   else if(tab==='pastes')    { showPanel('pastesPanel');    loadPastes(); }
   else if(tab==='stealer')   { showPanel('stealerPanel');   loadStealerStats(); }
   else if(tab==='telegram')  { showPanel('telegramPanel');  loadTelegramStats(); loadTelegram(); }
-  else if(tab==='canaries')  { showPanel('canariesPanel');  loadCanaries(); }
+  else if(tab==='intel')     { showPanel('intelPanel');     loadIntelDashboard(); }
+  else if(tab==='canaries')    { showPanel('canariesPanel');   loadCanaries(); }
+  else if(tab==='ransomware')  { showPanel('ransomwarePanel'); loadRansomware(); }
+  else if(tab==='stats')       { showPanel('statsPanel');      loadStats(); }
+  else if(tab==='network')     { showPanel('networkPanel');    loadNetwork(); }
 }
 
 // ── Load ───────────────────────────────────────────────────────────────────────
@@ -3109,14 +3460,7 @@ async function load(){
   renderPagination(res.total);
 }
 
-async function loadTop(){
-  const res = await fetch('/api/top').then(r=>r.json()).catch(()=>null);
-  if(!res) return;
-  res.forEach(s=>_siteCache[s.id]=s);
-  const shownEl = document.getElementById('shown');
-  if(shownEl) shownEl.textContent = res.length.toLocaleString()+' sites';
-  renderTopGrid(res);
-}
+async function loadTop(){}
 
 function onSearch(){clearTimeout(searchTimer);searchTimer=setTimeout(()=>{currentPage=1;load();},300);}
 
@@ -3377,7 +3721,7 @@ function toggleLeakFilter(f){
 function renderLeakTable(leaks,total){
   const wrap=document.getElementById('leakTableWrap');
   const pgEl=document.getElementById('leakPgEl');
-  if(!leaks.length){wrap.innerHTML='<div class="empty"><div class="empty-icon">🔓</div>No leaks found yet</div>';pgEl.innerHTML='';return;}
+  if(!leaks.length){wrap.innerHTML='<div class="empty"><div class="empty-icon">🔔</div>No leaks found yet</div>';pgEl.innerHTML='';return;}
   const rows=leaks.map(l=>{
     const title=esc(l.title||'[no title]');
     const url=esc(l.url||'');
@@ -3446,6 +3790,110 @@ async function searchPersonal(){
     </div>`).join('');
 }
 
+
+// ── Archive Import ─────────────────────────────────────────────────────────────
+async function queueArchiveImport(){
+  const download_url = document.getElementById('archiveUrl').value.trim();
+  if(!download_url){ toast('Download URL is required', 'error'); return; }
+
+  const params = new URLSearchParams({
+    download_url,
+    victim_name: document.getElementById('archiveVictim').value.trim(),
+    actor: document.getElementById('archiveActor').value.trim() || 'unknown',
+    leak_name: document.getElementById('archiveLeakName').value.trim(),
+    source_type: document.getElementById('archiveSourceType').value
+  });
+
+  const res = await fetch('/api/archive_import/create?' + params).then(r=>r.json()).catch(e=>({ok:false, reason:String(e)}));
+  if(res.ok){
+    toast('Archive job queued: #' + res.job_id, 'success');
+    document.getElementById('archiveUrl').value='';
+    loadArchiveImport();
+  } else {
+    toast(res.reason || 'Archive queue failed', 'error', 4500);
+    loadArchiveImport();
+  }
+}
+
+async function rerunArchiveJob(id){
+  const res = await fetch('/api/archive_import/run?id=' + encodeURIComponent(id)).then(r=>r.json()).catch(e=>({ok:false, reason:String(e)}));
+  if(res.ok) toast('Archive job restarted: #' + id, 'success');
+  else toast(res.reason || 'Restart failed', 'error', 4500);
+  loadArchiveImport();
+}
+
+async function loadArchiveImport(){
+  const wrap = document.getElementById('archiveImportWrap');
+  if(!wrap) return;
+  wrap.innerHTML = '<div class="empty"><div class="empty-icon">⏳</div>Loading archive jobs…</div>';
+  const res = await fetch('/api/archive_import/jobs').then(r=>r.json()).catch(()=>null);
+  if(!res || !res.jobs || !res.jobs.length){
+    wrap.innerHTML = '<div class="empty"><div class="empty-icon">📦</div>No archive import jobs yet</div>';
+    return;
+  }
+
+  const statusClass = (s)=>{
+    if(['processed'].includes(s)) return 'score-hi';
+    if(['infected','infected_extracted','error','worker_missing'].includes(s)) return 'score-lo';
+    return 'score-mid';
+  };
+
+  const rows = res.jobs.map(j=>{
+    const malware = j.malware_signature ? `<span class="chip chip-red">${esc(j.malware_signature)}</span>` : '';
+    const err = j.error ? `<div style="color:var(--red);font-size:11px;max-width:260px;white-space:normal;">${esc(j.error)}</div>` : '';
+    return `<tr>
+      <td class="td-mono">#${j.id}</td>
+      <td class="td-url"><a href="${esc(j.download_url||'')}" target="_blank">${esc(j.download_url||'')}</a></td>
+      <td class="td-small">${esc(j.victim_name||'')}</td>
+      <td class="td-small">${esc(j.actor||'unknown')}</td>
+      <td class="td-small">${esc(j.leak_name||'')}</td>
+      <td><span class="score-badge ${statusClass(j.status)}">${esc(j.status||'queued')}</span>${malware}${err}</td>
+      <td class="td-mono">${j.files_found||0} / ${j.files_processed||0}</td>
+      <td class="td-mono">${(j.entities_imported||0).toLocaleString()}</td>
+      <td class="td-mono">${esc(j.created_at||'')}</td>
+      <td class="td-actions">
+        <button class="row-btn" onclick="showArchiveFiles(${j.id})">files</button>
+        <button class="row-btn" onclick="rerunArchiveJob(${j.id})">run</button>
+      </td>
+    </tr>
+    <tr id="archiveFiles_${j.id}" style="display:none;"><td colspan="10" style="padding:0;background:rgba(59,130,246,0.03);"></td></tr>`;
+  }).join('');
+
+  wrap.innerHTML = `<table class="data-table">
+    <thead><tr>
+      <th>ID</th><th>URL</th><th>Victim</th><th>Actor</th><th>Leak</th><th>Status</th><th>Files</th><th>Entities</th><th>Created</th><th></th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+async function showArchiveFiles(id){
+  const row = document.getElementById('archiveFiles_' + id);
+  if(!row) return;
+  const td = row.querySelector('td');
+  if(row.style.display !== 'none'){
+    row.style.display = 'none';
+    return;
+  }
+  row.style.display = '';
+  td.innerHTML = '<div style="padding:10px 16px;color:var(--text-3);">Loading files…</div>';
+  const res = await fetch('/api/archive_import/files?id=' + encodeURIComponent(id)).then(r=>r.json()).catch(()=>null);
+  if(!res || !res.files || !res.files.length){
+    td.innerHTML = '<div style="padding:10px 16px;color:var(--text-3);">No files inventoried yet.</div>';
+    return;
+  }
+  td.innerHTML = `<table style="width:100%;">
+    ${res.files.map(f=>`<tr>
+      <td class="td-mono" style="padding-left:28px;max-width:480px;">${esc(f.file_path||'')}</td>
+      <td class="td-mono">${esc(f.file_ext||'')}</td>
+      <td class="td-mono">${(f.size_bytes||0).toLocaleString()} bytes</td>
+      <td><span class="score-badge ${f.score>=20?'score-hi':'score-lo'}">${f.score||0}</span></td>
+      <td class="td-small">${esc(f.status||'')}</td>
+      <td class="td-small">${esc(f.reason||'')}</td>
+    </tr>`).join('')}
+  </table>`;
+}
+
 // ── Alerts ─────────────────────────────────────────────────────────────────────
 async function loadAlerts(){
   const res=await fetch('/api/alerts').then(r=>r.json()).catch(()=>[]);
@@ -3494,7 +3942,8 @@ async function loadAlertHits(){
 
 // ── Stats ──────────────────────────────────────────────────────────────────────
 async function loadStats(){
-  const el=document.getElementById('statsPanel');
+  const panel=document.getElementById('statsPanel');
+  const el=panel.querySelector('.panel-scroll')||panel;
   el.innerHTML='<div class="empty"><div class="empty-icon">⏳</div>Loading stats…</div>';
   const s=await fetch('/api/stats').then(r=>r.json()).catch(()=>null);
   if(!s){el.innerHTML='<div class="empty">Failed to load stats</div>';return;}
@@ -3663,8 +4112,9 @@ async function poll(){
 
   updateDot(st.status);
   document.getElementById('hTotal').textContent   = (st.total||0).toLocaleString();
-  document.getElementById('hLeaks').textContent   = (st.leaks||0).toLocaleString();
-  document.getElementById('hMirrors').textContent = (st.mirrors||0).toLocaleString();
+  if(document.getElementById('hLeaks')) document.getElementById('hLeaks').textContent = (st.leaks||0).toLocaleString();
+  if(document.getElementById('hTgMsg')) document.getElementById('hTgMsg').textContent = (st.tg_messages||0).toLocaleString();
+  if(document.getElementById('hTgLeak')) document.getElementById('hTgLeak').textContent = (st.tg_leaks||0).toLocaleString();
 
   const hasNew = (st.new||0) > 0 || (st.new_leak||0) > 0;
 
@@ -3711,7 +4161,7 @@ async function poll(){
     // Keep slow polling so we catch manual file drops
     pollTimer = setInterval(poll, 10000);
     document.getElementById('btnStart').disabled  = false;
-    document.getElementById('btnStop').disabled   = true;
+    if(document.getElementById('btnStop'))document.getElementById('btnStop').disabled=true;
     document.getElementById('liveInd').style.display = 'none';
   }
 }
@@ -3743,13 +4193,27 @@ function updateDot(state){
 
 async function updateBookmarkCount(){
   const r=await fetch('/api/sites?view=bookmarked&q=&page=1').then(r=>r.json()).catch(()=>null);
-  if(r)document.getElementById('hBookmarks').textContent=r.total.toLocaleString();
+  // hBookmarks removed
+}
+
+async function resetCrawler(){
+  if(!confirm('Clear crawler JOBDIR and state? The next Start will begin a fresh crawl.')) return;
+  const r = await fetch('/api/reset_crawler').then(r=>r.json()).catch(()=>null);
+  if(r && r.ok){
+    addLog('Crawler state reset. Click Start to begin a fresh crawl.','b');
+    document.getElementById('btnStart').disabled = false;
+    if(document.getElementById('btnStop'))document.getElementById('btnStop').disabled=true;
+    document.getElementById('liveInd').style.display = 'none';
+    updateDot('idle');
+  } else {
+    addLog(`Reset failed: ${r?.reason || 'unknown error'}`,'r');
+  }
 }
 
 async function startCrawl(){
   await fetch('/api/start');
   document.getElementById('btnStart').disabled=true;
-  document.getElementById('btnStop').disabled=false;
+  if(document.getElementById('btnStop'))document.getElementById('btnStop').disabled=false;
   document.getElementById('liveInd').style.display='';
   addLog('Crawl started…','g');
   startPolling();
@@ -3758,7 +4222,7 @@ async function startCrawl(){
 async function stopCrawl(){
   await fetch('/api/stop');
   document.getElementById('btnStart').disabled=false;
-  document.getElementById('btnStop').disabled=true;
+  if(document.getElementById('btnStop'))document.getElementById('btnStop').disabled=true;
   document.getElementById('liveInd').style.display='none';
   addLog('Crawl stopped.','r');
 }
@@ -3906,8 +4370,10 @@ function filterByLang(lang){
 // ── Network graph tab ─────────────────────────────────────────────────────────
 async function loadNetwork(){
   const res=await fetch('/api/network').then(r=>r.json()).catch(()=>null);
+  const panel=document.getElementById('networkPanel');
+  const scroll=panel?panel.querySelector('.panel-scroll')||panel:null;
   if(!res||!res.nodes.length){
-    document.getElementById('networkPanel').innerHTML=
+    if(scroll) scroll.innerHTML=
       '<div class="empty"><div class="empty-icon">🕸</div>Not enough data for network graph yet</div>';
     return;
   }
@@ -4087,7 +4553,7 @@ async function loadCanaries(){
   } else if(pgEl) { pgEl.innerHTML=""; }
 }
 
-function goCanaryPage(p){ const pages=Math.ceil(document.getElementById("canaryTotal")?.textContent.replace(/,/g,"")||1/50); if(p<1)return; canaryPage=p; loadCanaries(); }
+function goCanaryPage(p){ const total=parseInt((document.getElementById("canaryTotal")?.textContent||"0").replace(/,/g,""))||0; const pages=Math.ceil(total/50)||1; if(p<1||p>pages)return; canaryPage=p; loadCanaries(); }
 
 // ── Stealer logs tab ──────────────────────────────────────────────────────────
 async function loadStealerStats(){
@@ -4189,25 +4655,21 @@ function goPastePage(p){const pages=Math.ceil(pasteTotal/50);if(p<1||p>pages)ret
 // ── Telegram tab ──────────────────────────────────────────────────────────────
 let tgView='leaks', tgPage=1, tgTotal=0;
 
-async function setTgTab(v){
+function setTgTab(v){
   tgView=v; tgPage=1;
   ['leaks','all','channels'].forEach(t=>{
     const el = document.getElementById('tg-tab-'+t);
     if(!el) return;
-    const isActive = t===v;
-    el.classList.toggle('active', isActive);
-    // Update inline style underline indicator
-    el.style.borderBottom = isActive ? '2px solid var(--accent)' : '';
-    el.style.marginBottom = isActive ? '-1px' : '';
-    el.style.color = isActive ? 'var(--accent-hi)' : '';
+    el.classList.toggle('on', t===v);
   });
+  loadTelegramOptions();
   loadTelegram();
 }
 
 async function muteChannel(url, btn){
   if(!url){ toast("No URL for channel","error"); return; }
-  const isActive = btn.textContent.trim() === "🔇";
-  const mute = isActive ? 1 : 0;  // 🔇 means currently active, click to mute
+  const isMuted = btn.textContent.trim() === "🔊";  // 🔊 = currently muted, click to unmute
+  const mute = isMuted ? 0 : 1;  // clicking unmute icon sends mute=0, clicking mute icon sends mute=1
   try {
     const res = await fetch("/api/telegram/mute?url="+encodeURIComponent(url)+"&mute="+mute)
       .then(r=>r.json());
@@ -4221,6 +4683,124 @@ async function muteChannel(url, btn){
   } catch(e){ toast("Mute failed","error"); }
 }
 
+function toggleTgMsg(id){
+  const s = document.getElementById(id+'-short');
+  const f = document.getElementById(id+'-full');
+  const b = document.getElementById(id+'-btn');
+  if(!s||!f||!b) return;
+  const expanded = f.style.display !== 'none';
+  s.style.display = expanded ? '' : 'none';
+  f.style.display = expanded ? 'none' : '';
+  b.textContent   = expanded ? '▼ Show more' : '▲ Show less';
+}
+
+
+function tgIntelBadges(m){
+  const tags = m.intel_tags || {};
+  const out = [];
+  const add = (label, value, conf, cls='') => {
+    if(!value) return;
+    const c = conf ? ` <span style="opacity:.7">${conf}%</span>` : '';
+    out.push(`<span class="mini-badge ${cls}" title="${esc(label)}">${esc(value)}${c}</span>`);
+  };
+  (tags.actor||[]).slice(0,2).forEach(t=>add('Actor', t.value, t.confidence, 'intel-actor'));
+  (tags.threat_type||[]).slice(0,1).forEach(t=>add('Threat Type', t.value, t.confidence, 'intel-threat'));
+  (tags.ttp||[]).slice(0,2).forEach(t=>add('TTP', t.value, t.confidence, 'intel-ttp'));
+  if(m.intel_ioc_count) add('IOCs', `IOCs:${m.intel_ioc_count}`, null, 'intel-ioc');
+  if(m.is_duplicate) add('Duplicate', 'Duplicate', null, 'intel-dupe');
+  return out.length ? `<div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:8px;">${out.join('')}</div>` : '';
+}
+
+function tgIntelDetails(m){
+  const tags = m.intel_tags || {};
+  const iocs = m.intel_iocs || {};
+  const sections = [];
+  const tagOrder = ['actor','threat_type','ttp','ner_ransom_group','ner_threat_actor','ner_malware','ner_exploit'];
+  tagOrder.forEach(k=>{
+    if(tags[k] && tags[k].length){
+      sections.push(`<div><b>${esc(k.replaceAll('_',' '))}</b>: ${tags[k].slice(0,6).map(t=>`${esc(t.value)} <span style="color:var(--text-3);">${t.confidence||50}%</span>`).join(', ')}</div>`);
+    }
+  });
+  Object.keys(iocs).sort().forEach(k=>{
+    if(iocs[k] && iocs[k].length){
+      sections.push(`<div><b>${esc(k)}</b>: ${iocs[k].slice(0,6).map(x=>esc(x.value)).join(', ')}</div>`);
+    }
+  });
+  if(!sections.length) return '';
+  return `<div style="margin-top:8px;padding:8px;border:1px solid var(--border);border-radius:10px;background:rgba(255,255,255,.025);font-size:11px;color:var(--text-2);line-height:1.6;">${sections.join('')}</div>`;
+}
+
+let tgOptionsLoaded=false;
+const TG_SOURCE_TIERS = ['actor_owned','affiliate','broker','intel_source','news_repost','random','spam','unknown'];
+const TG_SOURCE_LABELS = {
+  actor_owned:'Actor-owned', affiliate:'Affiliate', broker:'Broker', intel_source:'Intel source',
+  news_repost:'News/repost', random:'Random', spam:'Spam', unknown:'Unknown'
+};
+
+function fillSelect(id, values, firstLabel){
+  const el = document.getElementById(id);
+  if(!el) return;
+  const current = el.value;
+  el.innerHTML = `<option value="">${esc(firstLabel)}</option>` +
+    (values||[]).map(v=>`<option value="${esc(v)}">${esc(v)}</option>`).join('');
+  if(current && [...el.options].some(o=>o.value===current)) el.value = current;
+}
+
+async function loadTelegramOptions(){
+  if(tgOptionsLoaded) return;
+  const opts = await fetch('/api/telegram/filter_options').then(r=>r.json()).catch(()=>null);
+  if(!opts) return;
+  fillSelect('tgActor', opts.actors || [], 'All Actors');
+  fillSelect('tgThreat', opts.threats || [], 'All Threat Types');
+  fillSelect('tgTtp', opts.ttps || [], 'All TTPs');
+  fillSelect('tgIoc', opts.ioc_types || [], 'All IOC Types');
+  tgOptionsLoaded = true;
+}
+
+function resetTelegramFilters(){
+  ['tgActor','tgThreat','tgTtp','tgIoc','tgSourceTier','tgMinConf','tgDays'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.value='';
+  });
+  const hd=document.getElementById('tgHideDupes'); if(hd) hd.checked=false;
+  tgPage=1; loadTelegram();
+}
+
+function sourceTierBadge(tier){
+  const t = tier || 'unknown';
+  const label = TG_SOURCE_LABELS[t] || t;
+  return `<span class="mini-badge" title="Source tier">${esc(label)}</span>`;
+}
+
+function sourceTierSelect(c){
+  const current = c.source_tier || 'unknown';
+  const opts = TG_SOURCE_TIERS.map(t=>`<option value="${t}" ${t===current?'selected':''}>${esc(TG_SOURCE_LABELS[t]||t)}</option>`).join('');
+  return `<select class="select" style="max-width:135px;font-size:11px;padding:5px 8px;" data-url="${esc(c.url||'')}" onchange="updateChannelSourceTier(this)">${opts}</select>`;
+}
+
+async function updateChannelSourceTier(sel){
+  const url = sel.getAttribute('data-url') || '';
+  const tier = sel.value || 'unknown';
+  if(!url){ toast('No channel URL','error'); return; }
+  const res = await fetch('/api/telegram/source_tier?url='+encodeURIComponent(url)+'&tier='+encodeURIComponent(tier))
+    .then(r=>r.json()).catch(()=>null);
+  if(res && res.ok){
+    tgOptionsLoaded = false;
+    toast('Source tier updated','info');
+  } else {
+    toast((res && res.reason) || 'Source tier update failed','error');
+  }
+}
+
+function tgFilterParams(){
+  const get = id => (document.getElementById(id)||{}).value || '';
+  const params = new URLSearchParams({view:tgView, q:(document.getElementById('tgQ')||{}).value||'', page:String(tgPage)});
+  const fields = {actor:get('tgActor'), threat:get('tgThreat'), ttp:get('tgTtp'), ioc_type:get('tgIoc'), source_tier:get('tgSourceTier'), min_conf:get('tgMinConf'), days:get('tgDays')};
+  Object.entries(fields).forEach(([k,v])=>{ if(v) params.set(k,v); });
+  const hd = document.getElementById('tgHideDupes');
+  if(hd && hd.checked) params.set('hide_dupes','1');
+  return params.toString();
+}
+
 async function loadTelegramStats(){
   const s = await fetch('/api/telegram/stats').then(r=>r.json()).catch(()=>null);
   if(!s) return;
@@ -4231,8 +4811,8 @@ async function loadTelegramStats(){
 }
 
 async function loadTelegram(){
-  const q = document.getElementById('tgQ').value;
-  const res = await fetch(`/api/telegram?view=${tgView}&q=${encodeURIComponent(q)}&page=${tgPage}`)
+  await loadTelegramOptions();
+  const res = await fetch(`/api/telegram?${tgFilterParams()}`)
     .then(r=>r.json()).catch(()=>null);
   if(!res) return;
   const wrap = document.getElementById('tgTableWrap');
@@ -4251,10 +4831,11 @@ async function loadTelegram(){
       <td style="font-size:.75rem;color:#f0f6ff;">${esc(c.name||'')}</td>
       <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:var(--dim);">${esc(c.channel_type||'')}</td>
       <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:${c.joined?'var(--accent)':'var(--dim)'};">${c.joined?'joined':'pending'}</td>
+      <td>${sourceTierSelect(c)}</td>
       <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:var(--accent2);">${(c.message_count||0).toLocaleString()}</td>
-      <td><button class="icon-btn" data-url="${esc(c.url||'')}" onclick="event.stopPropagation();muteChannel(this.getAttribute('data-url'),this)" title="Mute/Unmute channel" style="${!c.active?'border-color:var(--red);color:var(--red);':''}">${c.active?'🔇':'🔊'}</button></td>
+      <td><button class="icon-btn" data-url="${esc(c.url||'')}" onclick="event.stopPropagation();muteChannel(this.getAttribute('data-url'),this)" title="Mute/Unmute channel" style="${!c.active?'border-color:var(--red);color:var(--red);':''}">${c.active?'&#128263;':'&#128266;'}</button></td>
     </tr>`).join('');
-    wrap.innerHTML=`<table><thead><tr><th>URL</th><th>Name</th><th>Type</th><th>Status</th><th>Messages</th></tr></thead><tbody>${rows}</tbody></table>`;
+    wrap.innerHTML=`<table><thead><tr><th>URL</th><th>Name</th><th>Type</th><th>Status</th><th>Source Tier</th><th>Messages</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
     pgEl.innerHTML='';
     return;
   }
@@ -4272,16 +4853,23 @@ async function loadTelegram(){
   const rows = messages.map(m=>{
     const ts = m.timestamp ? new Date(m.timestamp*1000).toLocaleString() : '';
     const confCol = m.confidence>=70?'var(--danger)':m.confidence>=45?'var(--amber)':'var(--text-3)';
-    const preview = esc((m.text||'').substring(0,300));
-    const chanHandle = esc(m.channel_name||'').replace('https://t.me/','');
-    const sevClass = m.confidence>=70?'sev-critical':m.confidence>=45?'sev-high':'sev-medium';
-    return`<tr style="vertical-align:top;">
-      <td style="font-size:12px;color:var(--text-2);white-space:nowrap;padding-top:14px;width:140px;">
-        ${chanHandle}
-      </td>
-      <td style="font-size:13px;color:var(--text);line-height:1.6;padding:12px 14px;max-width:500px;">
-        ${preview}
-      </td>
+ const fullText = esc(m.text||'');
+     const isTruncated = fullText.length > 300;
+     const preview = isTruncated ? fullText.substring(0,300) : fullText;
+     const msgId = 'tgmsg-'+m.id;
+     const chanHandle = esc(m.channel_name||'').replace('https://t.me/','');
+     const sevClass = m.confidence>=70?'sev-critical':m.confidence>=45?'sev-high':'sev-medium';
+     return`<tr style="vertical-align:top;">
+       <td style="font-size:12px;color:var(--text-2);white-space:nowrap;padding-top:14px;width:140px;">
+         ${chanHandle}<div style="margin-top:6px;">${sourceTierBadge(m.source_tier)}</div>
+       </td>
+       <td style="font-size:13px;color:var(--text);line-height:1.6;padding:12px 14px;max-width:500px;">
+         <span id="${msgId}-short">${preview}${isTruncated?'<span style="color:var(--text-3);">…</span>':''}</span>
+         ${isTruncated?`<span id="${msgId}-full" style="display:none;">${fullText}</span>
+         <br><button onclick="toggleTgMsg('${msgId}')" id="${msgId}-btn" style="margin-top:6px;background:none;border:none;color:var(--accent);font-size:11px;cursor:pointer;padding:0;font-family:inherit;">▼ Show more</button>`:''}
+         ${tgIntelBadges(m)}
+         ${tgIntelDetails(m)}
+       </td>
       <td style="padding-top:14px;white-space:nowrap;">
         ${m.has_leak?`<span class="sev ${sevClass}">${m.confidence}%</span>`:'<span style="color:var(--text-3);font-size:12px;">—</span>'}
       </td>
@@ -4302,21 +4890,158 @@ async function loadTelegram(){
 
 async function goTgPage(p){const pages=Math.ceil(tgTotal/50);if(p<1||p>pages)return;tgPage=p;loadTelegram();}
 
+// ── Intel Dashboard ───────────────────────────────────────────────────────────
+let _intelDashData = null;
+let _intelSubTab = 'overview';
+
+function intelList(title, rows, render, empty='No data yet'){
+  const body = rows && rows.length ? rows.map(render).join('') : `<div style="padding:14px;color:var(--text-3);font-size:12px;">${empty}</div>`;
+  return `<div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:12px;overflow:hidden;min-width:260px;">
+    <div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;color:var(--text);text-transform:uppercase;letter-spacing:.06em;">${title}</div>
+    <div>${body}</div>
+  </div>`;
+}
+
+function intelRow(left, right='', sub=''){
+  return `<div style="display:flex;justify-content:space-between;gap:12px;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.05);font-size:12px;">
+    <div style="min-width:0;"><div style="color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:520px;">${left}</div>${sub?`<div style="color:var(--text-3);font-size:11px;margin-top:3px;">${sub}</div>`:''}</div>
+    <div style="color:var(--accent-hi);font-family:Share Tech Mono,monospace;white-space:nowrap;">${right}</div>
+  </div>`;
+}
+
+function intelMetric(label, value, sub){
+  return `<div style="background:rgba(255,255,255,.035);border:1px solid var(--border);border-radius:12px;padding:14px;">
+    <div style="font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em;">${label}</div>
+    <div style="font-size:24px;color:var(--text);font-family:Share Tech Mono,monospace;margin-top:6px;">${Number(value||0).toLocaleString()}</div>
+    <div style="font-size:11px;color:var(--text-3);margin-top:3px;">${sub}</div>
+  </div>`;
+}
+
+function showIntelSubTab(tab){
+  _intelSubTab = tab || 'overview';
+  const ids = {overview:'intelTabOverview', actors:'intelTabActors', iocs:'intelTabIocs', channels:'intelTabChannels', recent:'intelTabRecent'};
+  Object.entries(ids).forEach(([key,id]) => {
+    const el = document.getElementById(id);
+    if(el) el.classList.toggle('active', key === _intelSubTab);
+  });
+  if(_intelDashData) renderIntelDashboard();
+}
+
+async function loadIntelDashboard(force=false){
+  const days = document.getElementById('intelDays')?.value || '7';
+  const wrap = document.getElementById('intelDashWrap');
+  if(!wrap) return;
+  wrap.innerHTML = '<div class="empty"><div class="empty-icon">&#8987;</div>Loading intel dashboard...</div>';
+  const data = await fetch(`/api/intel/dashboard?days=${encodeURIComponent(days)}${force?'&force=1':''}`).then(r=>r.json()).catch(()=>null);
+  if(!data){
+    wrap.innerHTML = '<div class="empty"><div class="empty-icon">&#9888;</div>Could not load intel dashboard.</div>';
+    return;
+  }
+  _intelDashData = data;
+  const s = data.summary || {};
+  const iocsEl = document.getElementById('intelIocs');
+  const tagsEl = document.getElementById('intelTags');
+  const dupesEl = document.getElementById('intelDupes');
+  const queueEl = document.getElementById('intelQueue');
+  if(iocsEl) iocsEl.textContent = (s.iocs||0).toLocaleString();
+  if(tagsEl) tagsEl.textContent = (s.tags||0).toLocaleString();
+  if(dupesEl) dupesEl.textContent = (s.duplicates||0).toLocaleString();
+  if(queueEl) queueEl.textContent = (s.queue||0).toLocaleString();
+  renderIntelDashboard();
+}
+
+function renderIntelDashboard(){
+  const data = _intelDashData || {};
+  const wrap = document.getElementById('intelDashWrap');
+  if(!wrap) return;
+  const s = data.summary || {};
+
+  const summary = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;">
+    ${intelMetric('Messages',(s.messages||0),'Total Telegram messages')}
+    ${intelMetric('Processed',(s.processed||0),'Enriched by worker')}
+    ${intelMetric('Queue',(s.queue||0),'Waiting for enrichment')}
+    ${intelMetric('Duplicates',(s.duplicates||0),'Reposts/mirrors detected')}
+    ${intelMetric('IOCs',(s.iocs||0),'Unique indicators')}
+    ${intelMetric('Tags',(s.tags||0),'Actor/TTP/threat tags')}
+  </div>`;
+
+  const actors = intelList('Top Actors', data.top_actors||[], r=>intelRow(esc(r.name), `${r.count||0}`, `avg confidence ${r.avg_conf||0}%`));
+  const threats = intelList('Threat Types', data.threat_types||[], r=>intelRow(esc(r.name), `${r.count||0}`, `avg confidence ${r.avg_conf||0}%`));
+  const ttps = intelList('Top TTPs', data.top_ttps||[], r=>intelRow(esc(r.name), `${r.count||0}`, `avg confidence ${r.avg_conf||0}%`));
+  const cves = intelList('Trending CVEs', data.top_cves||[], r=>intelRow(esc(r.value), `${r.times_seen||0}x`, `quality ${r.quality||0}`));
+  const iocs = intelList('Hot IOCs', data.hot_iocs||[], r=>intelRow(`<span style="color:var(--text-3);">${esc(r.type)}</span> ${esc(r.value)}`, `${r.times_seen||0}x`, `quality ${r.quality||0}`));
+  const channels = intelList('Top Telegram Sources', data.top_channels||[], r=>intelRow(esc(r.name||r.channel_id||'unknown'), `${r.messages||0}`, `${sourceTierBadge(r.source_tier)} leak hits: ${r.leaks||0}`));
+
+  const recent = data.recent_messages && data.recent_messages.length ? data.recent_messages.map(m=>{
+    const t = m.timestamp ? new Date(m.timestamp*1000).toLocaleString() : '';
+    const txt = esc(m.text||'').slice(0,320);
+    return `<div style="padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.06);">
+      <div style="display:flex;justify-content:space-between;gap:10px;margin-bottom:6px;">
+        <div style="font-size:12px;color:var(--accent-hi);">${esc(m.channel_name||'unknown')}</div>
+        <div style="font-size:11px;color:var(--text-3);white-space:nowrap;">${t}</div>
+      </div>
+      <div style="font-size:12px;color:var(--text);line-height:1.5;">${txt}${(m.text||'').length>320?'&hellip;':''}</div>
+      <div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;">${m.confidence?`<span class="tag-pill">confidence ${m.confidence}%</span>`:''}${tgIntelBadges(m)}</div>
+    </div>`;
+  }).join('') : '<div style="padding:14px;color:var(--text-3);font-size:12px;">No recent high-confidence messages.</div>';
+
+  if(_intelSubTab === 'actors'){
+    wrap.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;">${actors}${threats}${ttps}</div>`;
+  } else if(_intelSubTab === 'iocs'){
+    wrap.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;">${cves}${iocs}</div>`;
+  } else if(_intelSubTab === 'channels'){
+    wrap.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;">${channels}</div>`;
+  } else if(_intelSubTab === 'recent'){
+    wrap.innerHTML = `<div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:12px;overflow:hidden;">
+      <div style="padding:12px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;color:var(--text);text-transform:uppercase;letter-spacing:.06em;">Recent High-Confidence Telegram Messages</div>
+      ${recent}
+    </div>`;
+  } else {
+    wrap.innerHTML = `${summary}<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin-top:14px;">${actors}${threats}${cves}${channels}</div>`;
+  }
+}
+
 // ── Init ───────────────────────────────────────────────────────────────────────
 (async function init(){
   const st=await fetch('/api/status').then(r=>r.json()).catch(()=>null);
-  if(st){updateDot(st.status);document.getElementById('hTotal').textContent=(st.total||0).toLocaleString();document.getElementById('hLeaks').textContent=(st.leaks||0).toLocaleString();document.getElementById('hMirrors').textContent=(st.mirrors||0).toLocaleString();}
+  if(st){
+    if(document.getElementById('hLeaks')) document.getElementById('hLeaks').textContent=(st.leaks||0).toLocaleString();
+    if(document.getElementById('hTgMsg')) document.getElementById('hTgMsg').textContent=(st.tg_messages||0).toLocaleString();
+    if(document.getElementById('hTgLeak')) document.getElementById('hTgLeak').textContent=(st.tg_leaks||0).toLocaleString();
+  }
   await updateBookmarkCount();
-  setTab('top');
-  startPolling();
+
+  // Check if we landed on /group/{name} — open that group directly
+  const groupMatch = window.location.pathname.match(/^\/group\/(.+)$/);
+  if (groupMatch) {
+    const groupName = decodeURIComponent(groupMatch[1]);
+    await setTab('ransomware');
+    startPolling();
+    await rwOpenDetail(groupName);
+  } else {
+    setTab('leaks');
+    startPolling();
+  }
+
   if(st&&st.status==='running'){
     document.getElementById('btnStart').disabled=true;
-    document.getElementById('btnStop').disabled=false;
+    if(document.getElementById('btnStop'))document.getElementById('btnStop').disabled=false;
     document.getElementById('liveInd').style.display='';
     addLog('Crawl already running — reconnected.','g');
   }else{
     addLog(`Database ready. ${(st&&st.total)||0} clean sites.`,'b');
   }
+
+  // Handle browser back/forward through group pages
+  window.addEventListener('popstate', function(e) {
+    const m = window.location.pathname.match(/^\/group\/(.+)$/);
+    if (m) {
+      const name = decodeURIComponent(m[1]);
+      setTab('ransomware').then(() => rwOpenDetail(name));
+    } else {
+      if (_rwDetail) { _rwDetail = null; renderRwGrid(_rwCache || []); }
+    }
+  });
 })();
 
 
@@ -4336,6 +5061,512 @@ async function goTgPage(p){const pages=Math.ceil(tgTotal/50);if(p<1||p>pages)ret
 
 
 
+// ── Ransomware Groups tab (ransomware.live API) ──────────────────────────────
+let _rwCache   = null;
+let _rwDetail  = null;
+let _rwVictims = [];
+
+function rwVictimNum(g) {
+  const raw = g?.victims ?? g?.total_victims ?? g?.victim_count ?? 0;
+  const n = Number(String(raw).replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function rwNormalizeStatus(g) {
+  const explicit = (g?.status ?? g?.active_status ?? g?.state ?? '').toString().trim();
+  if (explicit) {
+    const sl = explicit.toLowerCase();
+    if (['active','up','online','running','live','1','true'].includes(sl)) return 'Active';
+    if (['inactive','down','offline','retired','closed','dead','0','false'].includes(sl)) return 'Inactive';
+    return explicit.charAt(0).toUpperCase() + explicit.slice(1);
+  }
+  // ransomware.live /groups exposes victims as the number of active victims.
+  // If no explicit status is returned, use that count as the safest status signal.
+  return rwVictimNum(g) > 0 ? 'Active' : 'Inactive';
+}
+
+async function loadRansomware(force=false) {
+  if (_rwCache && !force) { renderRwGrid(_rwCache); return; }
+  const el = document.getElementById('rwContent');
+  el.innerHTML = '<div class="empty"><div class="empty-icon">⏳</div>Loading from ransomware.live…</div>';
+  try {
+    const data = await fetch('/api/ransomware/groups').then(r => r.json());
+    if (data.error) {
+      el.innerHTML = `<div class="empty"><div class="empty-icon">⚠️</div>${esc(data.error)}</div>`;
+      return;
+    }
+    const raw = Array.isArray(data) ? data : (data.groups || Object.values(data));
+    // Normalise ALL field names once here — everything else just uses these
+    _rwCache = raw.map(g => ({
+      ...g,
+      name:        g.name        || g.group       || '',
+      status:      rwNormalizeStatus(g),
+      victims:     rwVictimNum(g),
+      firstseen:   g.firstseen   || g.first_seen  || '',
+      lastseen:    g.lastseen    || g.last_seen    || '',
+      description: g.description || g.summary     || '',
+    }));
+    updateRwStats(_rwCache);
+    renderRwGrid(_rwCache);
+  } catch(e) {
+    el.innerHTML = `<div class="empty"><div class="empty-icon">⚠️</div>Failed: ${esc(String(e))}</div>`;
+  }
+}
+
+function updateRwStats(groups) {
+  document.getElementById('rwGangCount').textContent   = groups.length;
+  const active = groups.filter(g => rwNormalizeStatus(g).toLowerCase() === 'active').length;
+  document.getElementById('rwActiveCount').textContent  = active;
+  const totalVictims = groups.reduce((a,g) => a + (typeof g.victims === 'number' ? g.victims : 0), 0);
+  document.getElementById('rwVictimCount').textContent = totalVictims.toLocaleString();
+  const badge = document.getElementById('rwBadge');
+  if (badge && totalVictims > 0) { badge.textContent = totalVictims.toLocaleString(); badge.style.display = ''; }
+}
+
+function filterRansomware() {
+  if (!_rwCache) return;
+  if (_rwDetail) { renderRwDetail(_rwDetail); return; }
+  renderRwGrid(_rwCache);
+}
+
+function setRwTab(tab) {
+  // sub-tabs are no longer used in live-API mode — just refresh
+  renderRwGrid(_rwCache || []);
+}
+
+function renderRwGrid(groups) {
+  if (_rwDetail) return;
+  const q      = (document.getElementById('rwQ')?.value || '').toLowerCase();
+  const el     = document.getElementById('rwContent');
+  const status = document.getElementById('rwStatus')?.value || '';
+
+  const filtered = (groups || []).filter(g => {
+    const name = (g.name||'').toLowerCase();
+    const st   = rwNormalizeStatus(g);
+    return (!q || name.includes(q)) && (!status || st === status);
+  });
+
+  document.getElementById('rwShown').textContent = filtered.length + ' groups';
+
+  if (!filtered.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-icon">☠️</div>No groups found.</div>';
+    return;
+  }
+
+  const statusColor = s => {
+    const sl = (s||'').toLowerCase();
+    return sl==='active' ? 'var(--red)' : sl==='inactive' ? 'var(--text-3)' : 'var(--amber)';
+  };
+  const statusDot = s => {
+    const sl = (s||'').toLowerCase();
+    return sl==='active' ? '🔴' : sl==='inactive' ? '⚫' : '🟡';
+  };
+
+  const cards = filtered.map(g => {
+    const name    = g.name || '?';
+    const status2 = rwNormalizeStatus(g);
+    const victims = g.victims != null ? g.victims : '?';
+    const since   = (g.firstseen||'').split('T')[0];
+    const last    = (g.lastseen||'').split('T')[0];
+    const desc    = (g.description||'').slice(0,100);
+
+    return `<div onclick="rwOpenDetail('${jsEsc(name)}')"
+      style="background:var(--surface);border:1px solid var(--border);border-top:2px solid ${statusColor(status2)};
+             border-radius:10px;padding:14px 16px;cursor:pointer;
+             transition:border-color 180ms var(--ease-out),background 180ms;"
+      onmouseover="this.style.background='var(--surface2)'"
+      onmouseout="this.style.background='var(--surface)'">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:6px;">
+        <div style="font-weight:600;font-size:13px;color:var(--text);font-family:'JetBrains Mono',monospace;
+                    text-transform:uppercase;letter-spacing:.04em;word-break:break-word;">${esc(name)}</div>
+        <div style="font-size:10px;color:${statusColor(status2)};white-space:nowrap;flex-shrink:0;">
+          ${statusDot(status2)} ${esc(status2)}
+        </div>
+      </div>
+      ${desc ? `<div style="font-size:11px;color:var(--text-3);line-height:1.5;margin-bottom:10px;
+                              display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;">
+                  ${esc(desc)}</div>` : ''}
+      <div style="display:flex;gap:12px;font-size:11px;font-family:'JetBrains Mono',monospace;
+                  border-top:1px solid var(--border);padding-top:8px;margin-top:4px;">
+        <div><span style="color:var(--text-3);">victims </span>
+             <span style="color:var(--red);font-weight:600;">${esc(String(victims))}</span></div>
+        ${since ? `<div><span style="color:var(--text-3);">since </span>
+                        <span style="color:var(--text-2);">${esc(since)}</span></div>` : ''}
+        ${last  ? `<div><span style="color:var(--text-3);">last </span>
+                        <span style="color:var(--text-2);">${esc(last)}</span></div>`  : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  el.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+                               gap:12px;padding:16px;align-content:start;">${cards}</div>`;
+}
+
+// ── Group detail page ─────────────────────────────────────────────────────────
+async function rwOpenDetail(name) {
+  _rwDetail = name;
+  // Update URL so this page is bookmarkable / shareable
+  history.pushState({group: name}, '', '/group/' + encodeURIComponent(name.toLowerCase().trim()));
+  document.title = name.toUpperCase() + ' — Dark Crawler';
+
+  const el = document.getElementById('rwContent');
+  el.innerHTML = `<div style="padding:16px;"><button class="btn" onclick="rwCloseDetail()" style="margin-bottom:16px;">← Back</button>
+    <div style="color:var(--text-3);font-family:'JetBrains Mono',monospace;font-size:.8rem;">Loading ${esc(name)}…</div></div>`;
+
+  try {
+    const d = await fetch(`/api/ransomware/group?name=${encodeURIComponent(name.toLowerCase().trim())}`).then(r => r.json());
+    renderRwDetail(d);
+  } catch(e) {
+    el.innerHTML = `<div style="padding:16px;"><button class="btn" onclick="rwCloseDetail()">← Back</button>
+      <div style="color:var(--red);margin-top:12px;">Error: ${esc(String(e))}</div></div>`;
+  }
+}
+
+function renderRwDetail(d) {
+  const el = document.getElementById('rwContent');
+
+  // /group/{name} returns the group object directly (or array-wrapped)
+  const _d = Array.isArray(d) ? d[0] : d;
+
+  const status   = rwNormalizeStatus(_d);
+  const victims  = rwVictimNum(_d);
+  const since    = (_d.firstseen || _d.first_seen || '').split('T')[0];
+  const last     = (_d.lastseen  || _d.last_seen  || '').split('T')[0];
+  const locations    = _d.locations    || [];
+  const ttps         = _d.ttps         || [];
+  const vulns        = _d.vulnerabilities || [];
+  const tools        = _d.tools        || [];
+
+  const statusColor = s => {
+    const sl = (s||'').toLowerCase();
+    return sl==='active' ? 'var(--red)' : sl==='inactive' ? 'var(--text-3)' : 'var(--amber)';
+  };
+
+  const pill = (label, val, col='var(--text-2)') =>
+    `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;min-width:100px;">
+       <div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px;">${label}</div>
+       <div style="font-size:16px;font-weight:600;color:${col};font-family:'JetBrains Mono',monospace;">${esc(String(val))}</div>
+     </div>`;
+
+  const tag = (t, bc='var(--border2)', tc='var(--text-2)') =>
+    `<span style="background:var(--surface2);border:1px solid ${bc};color:${tc};
+                  padding:3px 10px;border-radius:4px;font-size:11px;
+                  font-family:'JetBrains Mono',monospace;white-space:nowrap;">${esc(String(t))}</span>`;
+
+  const section = (title, body) =>
+    `<div style="margin-bottom:24px;">
+       <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;
+                   color:var(--text-3);margin-bottom:10px;padding-bottom:6px;
+                   border-bottom:1px solid var(--border);">${title}</div>
+       ${body}
+     </div>`;
+
+  // ── Sticky header bar ──
+  let html = `
+  <div style="display:flex;align-items:center;gap:12px;padding:10px 16px;
+              background:var(--surface);border-bottom:1px solid var(--border);
+              position:sticky;top:0;z-index:10;flex-wrap:wrap;">
+    <button class="btn" onclick="rwCloseDetail()" style="font-size:11px;padding:4px 10px;">← Back to Groups</button>
+    <div style="font-size:18px;font-weight:700;font-family:'JetBrains Mono',monospace;
+                text-transform:uppercase;letter-spacing:.06em;color:var(--text);flex:1;">${esc(_d.name||'')}</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <span style="font-size:12px;padding:4px 12px;border-radius:20px;
+                   border:1px solid ${statusColor(status)};color:${statusColor(status)};">${esc(status)}</span>
+      ${_d.has_negotiations ? '<span style="font-size:11px;padding:3px 10px;border-radius:20px;background:rgba(59,130,246,.1);border:1px solid var(--accent);color:var(--accent-hi);">💬 Chat Logs</span>' : ''}
+      ${_d.has_ransomnote   ? '<span style="font-size:11px;padding:3px 10px;border-radius:20px;background:rgba(245,158,11,.1);border:1px solid var(--amber);color:var(--amber);">📄 Ransom Notes</span>' : ''}
+      <button class="btn" onclick="loadRansomware(true)" style="font-size:11px;padding:4px 10px;" title="Refresh from API">↻</button>
+    </div>
+  </div>
+
+  <div style="padding:20px;">
+
+  <!-- Stat pills row -->
+  <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px;">
+    ${pill('Total Victims', typeof victims==='number' ? victims.toLocaleString() : victims, 'var(--red)')}
+    ${since ? pill('First Seen', since) : ''}
+    ${last  ? pill('Last Active', last) : ''}
+    ${_d.negotiation_count ? pill('Negotiations', _d.negotiation_count, 'var(--amber)') : ''}
+    ${_d.ransomnotes_count  ? pill('Ransom Notes',  _d.ransomnotes_count,  'var(--amber)') : ''}
+  </div>`;
+
+  // ── Description ──
+  if (_d.description) {
+    html += section('Description',
+      `<div style="font-size:13px;color:var(--text-2);line-height:1.75;max-width:860px;">${esc(_d.description)}</div>`);
+  }
+
+  // ── Leak site URLs (locations array) ──
+  // Each location object has: fqdn, title, available, url, screenshot_url, ...
+  if (locations.length) {
+    const linkRows = locations.map(loc => {
+      const url   = loc.fqdn || loc.url || '';
+      const title = loc.title || '';
+      const up    = loc.available;
+      const isTor = url.includes('.onion');
+      const upBadge = up===true  ? '<span style="color:var(--green);font-size:10px;margin-left:6px;">● online</span>'
+                    : up===false ? '<span style="color:var(--red);font-size:10px;margin-left:6px;">● offline</span>'
+                    : '';
+      return `<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.04);">
+        <span style="font-size:10px;padding:1px 6px;border-radius:3px;flex-shrink:0;
+                     border:1px solid ${isTor?'var(--accent)':'var(--accent2)'};
+                     color:${isTor?'var(--accent)':'var(--accent2)'};">${isTor?'TOR':'WEB'}</span>
+        <div style="flex:1;min-width:0;">
+          <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent-hi);
+                      overflow-wrap:break-word;word-break:break-all;">${esc(url)}${upBadge}</div>
+          ${title ? `<div style="font-size:11px;color:var(--text-3);margin-top:2px;">${esc(title)}</div>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+    html += section(`Leak Site URLs (${locations.length})`,
+      `<div style="display:flex;flex-direction:column;">${linkRows}</div>`);
+  }
+
+  // ── MITRE ATT&CK TTPs ──
+  // Each ttp object has: tid (e.g. "T1486"), tactic, technique
+  if (ttps.length) {
+    const ttpRows = ttps.map(t => {
+      const tid  = t.tid || t.id || t.technique_id || '';
+      const name = t.technique || t.name || '';
+      const tact = t.tactic || '';
+      return `<div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);">
+        <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent);
+                     flex-shrink:0;min-width:80px;">${esc(tid)}</span>
+        <div>
+          ${name ? `<div style="font-size:12px;color:var(--text);">${esc(name)}</div>` : ''}
+          ${tact ? `<div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.05em;margin-top:2px;">${esc(tact)}</div>` : ''}
+        </div>
+      </div>`;
+    }).join('');
+    html += section(`MITRE ATT&CK TTPs (${ttps.length})`, ttpRows);
+  }
+
+  // ── CVEs / Vulnerabilities ──
+  // Each vuln object has: CVE, CVSS (score), description
+  if (vulns.length) {
+    const vulnRows = vulns.map(v => {
+      const id   = v.CVE || v.cve_id || v.id || '';
+      const cvss = v.CVSS || v.cvss_score || '';
+      const desc = v.description || '';
+      const sevColor = cvss >= 9 ? 'var(--red)' : cvss >= 7 ? 'var(--amber)' : cvss >= 4 ? 'var(--accent-hi)' : 'var(--text-3)';
+      return `<div style="display:flex;align-items:flex-start;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);">
+        <a href="https://nvd.nist.gov/vuln/detail/${esc(id)}" target="_blank"
+           style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--amber);
+                  flex-shrink:0;min-width:140px;text-decoration:none;">${esc(id)} ↗</a>
+        ${cvss ? `<span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:${sevColor};flex-shrink:0;">CVSS ${cvss}</span>` : ''}
+        ${desc ? `<span style="font-size:11px;color:var(--text-2);">${esc(String(desc).substring(0,120))}${String(desc).length>120?'…':''}</span>` : ''}
+      </div>`;
+    }).join('');
+    html += section(`Exploited CVEs (${vulns.length})`, vulnRows);
+  }
+
+  // ── Tools & Malware ──
+  // Each tool object has: tool (name string)
+  if (tools.length) {
+    const toolTags = tools.map(t => {
+      const name = t.tool || t.name || (typeof t==='string' ? t : '');
+      return name ? tag(name, 'rgba(59,130,246,.4)', 'var(--accent-hi)') : '';
+    }).join(' ');
+    html += section(`Tools & Malware Families (${tools.length})`,
+      `<div style="display:flex;flex-wrap:wrap;gap:6px;">${toolTags}</div>`);
+  }
+
+  html += section('Telegram Correlation', `<div id="rwCorrelation" style="font-size:12px;color:var(--text-3);">Loading Telegram correlation...</div>`);
+
+  html += section('Victim Timeline Correlation', `<div id="rwVictimTimeline" style="font-size:12px;color:var(--text-3);">Checking ransomware.live victim fields...</div>`);
+
+  html += '</div>'; // close padding div
+  el.innerHTML = html;
+  loadRwCorrelation(_d.name || _rwDetail || '');
+  renderRwVictimTimelineBox(_d.name || _rwDetail || '', _d);
+}
+
+
+async function loadRwCorrelation(name){
+  const el = document.getElementById('rwCorrelation');
+  if(!el || !name) return;
+  const data = await fetch('/api/ransomware/correlation?name='+encodeURIComponent(name))
+    .then(r=>r.json()).catch(e=>({error:String(e)}));
+  if(!data || data.error){
+    el.innerHTML = `<div style="color:var(--amber);">No correlation data available${data&&data.error?': '+esc(data.error):''}</div>`;
+    return;
+  }
+  const lastSeen = data.last_seen ? new Date(data.last_seen*1000).toLocaleString() : 'Never';
+  const metric = (label,val,color='var(--accent-hi)') => `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;min-width:110px;"><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px;">${label}</div><div style="font-family:JetBrains Mono,monospace;font-size:16px;font-weight:700;color:${color};">${esc(String(val))}</div></div>`;
+  const tinyTable = (headers, rows) => {
+    if(!rows || !rows.length) return '<div style="color:var(--text-3);font-size:12px;">No matches yet.</div>';
+    return `<table class="data-table" style="font-size:12px;"><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table>`;
+  };
+  const channels = tinyTable(['Channel','Tier','Mentions','Last Seen'], (data.top_channels||[]).map(c=>`
+    <tr><td>${esc(c.channel_name||'unknown')}</td><td>${esc(c.source_tier||'unknown')}</td><td>${c.mentions||0}</td><td>${c.last_seen?new Date(c.last_seen*1000).toLocaleString():''}</td></tr>`));
+  const ttps = (data.top_ttps||[]).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;">${data.top_ttps.map(t=>`<span class="mini-badge intel-ttp">${esc(t.tag_value)} <span style="opacity:.65">${t.mentions}x</span></span>`).join('')}</div>` : '<div style="color:var(--text-3);font-size:12px;">No TTP tags yet.</div>';
+  const cves = (data.related_cves||[]).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;">${data.related_cves.map(c=>`<span class="mini-badge intel-ioc">${esc(c.cve)} <span style="opacity:.65">${c.mentions}x</span></span>`).join('')}</div>` : '<div style="color:var(--text-3);font-size:12px;">No CVEs tied to this group yet.</div>';
+  const iocs = (data.related_iocs||[]).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;">${data.related_iocs.map(i=>`<span class="mini-badge intel-ioc" title="${esc(i.value)}">${esc(i.type)}:${esc(String(i.value).slice(0,42))}${String(i.value).length>42?'...':''} <span style="opacity:.65">${i.mentions}x</span></span>`).join('')}</div>` : '<div style="color:var(--text-3);font-size:12px;">No related high-signal IOCs yet.</div>';
+  const recent = (data.recent_messages||[]).length ? data.recent_messages.map(m=>{
+    const ts = m.timestamp ? new Date(m.timestamp*1000).toLocaleString() : '';
+    const text = esc((m.text||'').slice(0,260));
+    return `<div style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05);">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:5px;"><span style="color:var(--accent-hi);font-family:JetBrains Mono,monospace;font-size:11px;">${esc(m.channel_name||'unknown')}</span><span style="color:var(--text-3);font-size:11px;">${ts}</span>${m.confidence?`<span class="mini-badge intel-threat">${m.confidence}%</span>`:''}</div>
+      <div style="color:var(--text-2);font-size:12px;line-height:1.55;">${text}${(m.text||'').length>260?'...':''}</div>
+      ${tgIntelBadges(m)}
+    </div>`;
+  }).join('') : '<div style="color:var(--text-3);font-size:12px;">No recent Telegram messages found for this group.</div>';
+
+  el.innerHTML = `
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;">
+      ${metric('Mentions', (data.mentions||0).toLocaleString(), 'var(--red)')}
+      ${metric('24h', (data.mentions_24h||0).toLocaleString(), 'var(--amber)')}
+      ${metric('7d', (data.mentions_7d||0).toLocaleString(), 'var(--accent-hi)')}
+      ${metric('Last Seen', lastSeen, 'var(--text-2)')}
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:16px;">
+      <div><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Top Telegram Channels</div>${channels}</div>
+      <div><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Top TTPs</div>${ttps}<div style="height:12px"></div><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Related CVEs</div>${cves}</div>
+    </div>
+    <div style="margin-bottom:16px;"><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Related IOCs</div>${iocs}</div>
+    <div><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Recent Telegram Messages</div>${recent}</div>
+  `;
+}
+
+
+function rwCandidateVictimArrays(d){
+  const arrays = [];
+  const keys = ['posts','victims_list','recent_victims','group_posts','victim_posts','victims'];
+  for(const k of keys){ if(Array.isArray(d && d[k])) arrays.push(d[k]); }
+  if(d && d.data){ for(const k of keys){ if(Array.isArray(d.data[k])) arrays.push(d.data[k]); } }
+  return arrays;
+}
+
+function rwExtractVictims(d){
+  const seen = new Set();
+  const out = [];
+  const arrays = rwCandidateVictimArrays(d);
+  for(const arr of arrays){
+    for(const item of arr){
+      if(!item || typeof item !== 'object') continue;
+      const name = item.victim || item.victim_name || item.company || item.name || item.post_title || item.title || item.target || '';
+      if(!name || typeof name !== 'string') continue;
+      const clean = name.trim();
+      if(clean.length < 3) continue;
+      const domain = item.domain || item.website || item.url || item.fqdn || '';
+      const country = item.country || item.country_code || item.location || '';
+      const sector = item.sector || item.industry || item.activity || '';
+      const publishedRaw = item.published || item.published_at || item.discovered || item.discovered_at || item.date || item.created_at || item.updated_at || '';
+      let publishedTs = 0;
+      if(typeof publishedRaw === 'number') publishedTs = publishedRaw;
+      else if(publishedRaw){
+        const dt = Date.parse(String(publishedRaw));
+        if(!Number.isNaN(dt)) publishedTs = Math.floor(dt/1000);
+      }
+      const key = (clean+'|'+domain).toLowerCase();
+      if(seen.has(key)) continue;
+      seen.add(key);
+      out.push({name:clean, domain:String(domain||''), country:String(country||''), sector:String(sector||''), published_ts:publishedTs});
+      if(out.length >= 25) return out;
+    }
+  }
+  return out;
+}
+
+function renderRwVictimTimelineBox(groupName, d){
+  const el = document.getElementById('rwVictimTimeline');
+  if(!el) return;
+  _rwVictims = rwExtractVictims(d);
+  if(!_rwVictims.length){
+    el.innerHTML = `<div style="color:var(--text-3);line-height:1.6;">No victim list was returned by this ransomware.live group detail response. If the API provides victims from another endpoint later, this section can use it without changing the Telegram worker.</div>`;
+    return;
+  }
+  const rows = _rwVictims.slice(0,15).map((v,i)=>{
+    const date = v.published_ts ? new Date(v.published_ts*1000).toLocaleDateString() : '';
+    return `<tr>
+      <td style="font-weight:600;color:var(--text);">${esc(v.name)}</td>
+      <td>${esc(v.domain||'')}</td>
+      <td>${esc(v.country||'')}</td>
+      <td>${esc(v.sector||'')}</td>
+      <td>${esc(date)}</td>
+      <td><button class="btn rw-victim-btn" data-index="${i}" style="font-size:11px;padding:3px 8px;">Check Telegram</button></td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `
+    <div style="margin-bottom:10px;color:var(--text-3);line-height:1.6;">Found ${_rwVictims.length} victim records from ransomware.live for this group. Pick one to search Telegram before/after the ransomware post.</div>
+    <table class="data-table" style="font-size:12px;margin-bottom:14px;">
+      <thead><tr><th>Victim</th><th>Domain</th><th>Country</th><th>Sector</th><th>Published</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div id="rwVictimTimelineResult"></div>
+  `;
+  el.querySelectorAll('.rw-victim-btn').forEach(btn=>{
+    btn.addEventListener('click',()=>{
+      const idx = parseInt(btn.getAttribute('data-index')||'0',10);
+      rwLoadVictimTimeline(groupName, _rwVictims[idx]);
+    });
+  });
+}
+
+async function rwLoadVictimTimeline(groupName, victim){
+  const el = document.getElementById('rwVictimTimelineResult');
+  if(!el || !victim) return;
+  el.innerHTML = `<div style="color:var(--text-3);font-size:12px;">Searching Telegram for ${esc(victim.name)}...</div>`;
+  const qs = new URLSearchParams({
+    group: groupName || '',
+    victim: victim.name || '',
+    domain: victim.domain || '',
+    published: String(victim.published_ts || 0)
+  });
+  const data = await fetch('/api/ransomware/victim_timeline?'+qs.toString())
+    .then(r=>r.json()).catch(e=>({error:String(e)}));
+  if(!data || data.error){
+    el.innerHTML = `<div style="color:var(--amber);">No timeline data available${data&&data.error?': '+esc(data.error):''}</div>`;
+    return;
+  }
+  const metric = (label,val,color='var(--accent-hi)') => `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;min-width:110px;"><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:3px;">${label}</div><div style="font-family:JetBrains Mono,monospace;font-size:16px;font-weight:700;color:${color};">${esc(String(val))}</div></div>`;
+  const published = data.published_ts ? new Date(data.published_ts*1000).toLocaleString() : 'Unknown';
+  const channels = (data.top_channels||[]).length ? `<table class="data-table" style="font-size:12px;"><thead><tr><th>Channel</th><th>Tier</th><th>Mentions</th><th>Last Seen</th></tr></thead><tbody>${data.top_channels.map(c=>`<tr><td>${esc(c.channel_name||'unknown')}</td><td>${esc(c.source_tier||'unknown')}</td><td>${c.mentions||0}</td><td>${c.last_seen?new Date(c.last_seen*1000).toLocaleString():''}</td></tr>`).join('')}</tbody></table>` : '<div style="color:var(--text-3);font-size:12px;">No Telegram channel matches.</div>';
+  const cves = (data.related_cves||[]).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;">${data.related_cves.map(c=>`<span class="mini-badge intel-ioc">${esc(c.cve)} <span style="opacity:.65">${c.mentions}x</span></span>`).join('')}</div>` : '<div style="color:var(--text-3);font-size:12px;">No CVEs found in matched messages.</div>';
+  const iocs = (data.related_iocs||[]).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;">${data.related_iocs.map(i=>`<span class="mini-badge intel-ioc" title="${esc(i.value)}">${esc(i.type)}:${esc(String(i.value).slice(0,42))}${String(i.value).length>42?'...':''} <span style="opacity:.65">${i.mentions}x</span></span>`).join('')}</div>` : '<div style="color:var(--text-3);font-size:12px;">No high-signal IOCs found in matched messages.</div>';
+  const timeline = (data.timeline||[]).length ? data.timeline.map(m=>{
+    const ts = m.timestamp ? new Date(m.timestamp*1000).toLocaleString() : '';
+    const rel = m.timeline_relation === 'before' ? `Before post${m.days_from_publish!=null?` (${m.days_from_publish}d)`:''}` : m.timeline_relation === 'after' ? `After post${m.days_from_publish!=null?` (${m.days_from_publish}d)`:''}` : 'Seen';
+    const relColor = m.timeline_relation === 'before' ? 'var(--amber)' : m.timeline_relation === 'after' ? 'var(--accent-hi)' : 'var(--text-3)';
+    const text = esc((m.text||'').slice(0,320));
+    return `<div style="position:relative;padding:12px 0 12px 18px;border-left:2px solid var(--border);border-bottom:1px solid rgba(255,255,255,.04);">
+      <div style="position:absolute;left:-6px;top:17px;width:10px;height:10px;border-radius:999px;background:${relColor};"></div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:5px;">
+        <span style="color:${relColor};font-family:JetBrains Mono,monospace;font-size:11px;">${esc(rel)}</span>
+        <span style="color:var(--accent-hi);font-family:JetBrains Mono,monospace;font-size:11px;">${esc(m.channel_name||'unknown')}</span>
+        <span style="color:var(--text-3);font-size:11px;">${ts}</span>
+        ${m.confidence?`<span class="mini-badge intel-threat">${m.confidence}%</span>`:''}
+      </div>
+      <div style="color:var(--text-2);font-size:12px;line-height:1.55;">${text}${(m.text||'').length>320?'...':''}</div>
+      ${tgIntelBadges(m)}
+    </div>`;
+  }).join('') : '<div style="color:var(--text-3);font-size:12px;">No Telegram messages matched this victim/domain.</div>';
+  el.innerHTML = `
+    <div style="background:rgba(59,130,246,.04);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:14px;">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
+        <div><div style="font-size:15px;font-weight:700;color:var(--text);">${esc(data.victim||victim.name)}</div><div style="font-size:11px;color:var(--text-3);margin-top:3px;">Published: ${esc(published)} ${data.domain?`&nbsp; Domain: ${esc(data.domain)}`:''}</div></div>
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+        ${metric('Mentions', (data.mentions||0).toLocaleString(), 'var(--red)')}
+        ${metric('Before', (data.before||0).toLocaleString(), 'var(--amber)')}
+        ${metric('After', (data.after||0).toLocaleString(), 'var(--accent-hi)')}
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:14px;">
+        <div><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Top Channels</div>${channels}</div>
+        <div><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Related CVEs</div>${cves}<div style="height:12px"></div><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Related IOCs</div>${iocs}</div>
+      </div>
+      <div><div style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;">Timeline</div>${timeline}</div>
+    </div>
+  `;
+}
+
+function rwCloseDetail() {
+  _rwDetail = null;
+  history.pushState({}, '', '/');
+  document.title = 'Dark Crawler';
+  renderRwGrid(_rwCache || []);
+}
+
+
 </script>
 </body>
 </html>
@@ -4344,7 +5575,6 @@ async function goTgPage(p){const pages=Math.ceil(tgTotal/50);if(p<1||p>pages)ret
 if __name__ == "__main__":
     ensure_db()
     ensure_indexes()
-    _recrawl_thread.start()
     print("  Dark Crawler")
     print("  ----------------------------")
     print("  http://localhost:" + str(PORT))

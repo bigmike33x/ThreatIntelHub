@@ -48,6 +48,23 @@ except ImportError:
     HAS_TELETHON = False
     log.error("Telethon not installed. Run: pip install telethon")
 
+# ── Stealer detection (shared module) ─────────────────────────────────────────
+try:
+    from stealer_detection import detect_stealers
+    HAS_STEALER_DETECTION = True
+except ImportError:
+    HAS_STEALER_DETECTION = False
+    log.warning("stealer_detection.py not found — stealer intel disabled. "
+                "Place stealer_detection.py in the same directory.")
+
+# ── Message intel extraction (creds, C2, tools, actor handles) ────────────────
+try:
+    from message_intel import extract_message_intel
+    HAS_MESSAGE_INTEL = True
+except ImportError:
+    HAS_MESSAGE_INTEL = False
+    log.warning("message_intel.py not found — cred/C2/tool/actor extraction disabled.")
+
 BASE_DIR   = Path(__file__).parent
 DB_PATH    = BASE_DIR / "crawler.db"
 SEEDS_FILE = BASE_DIR / "cti_seeds.json"
@@ -84,15 +101,23 @@ NOISE_SIGNALS = [
 ]
 
 def analyze_message(text):
+    """
+    Score a message for leak/threat content.
+    Returns (is_leak, score, ext_dict) where ext_dict contains all extracted
+    intel including stealer family detection if stealer_detection.py is available.
+    """
     if not text or len(text) < 20:
         return False, 0, {}
+
     tl    = text.lower()
     score = 0
     ext   = {}
 
+    # Hard noise filter — bail early on pure vendor spam
     if sum(1 for k in NOISE_SIGNALS if k in tl) >= 2:
         return False, 0, {}
 
+    # ── Base leak signals ──────────────────────────────────────────────────────
     emails = EMAIL_RE.findall(text)
     if len(emails) >= 3:
         score += 30
@@ -130,6 +155,30 @@ def analyze_message(text):
     if new_channels:
         ext['discovered_channels'] = [f"https://t.me/{c}" for c in new_channels[:5]]
 
+    # ── Stealer family detection ───────────────────────────────────────────────
+    if HAS_STEALER_DETECTION:
+        stealer = detect_stealers(text)
+        if stealer['families'] or stealer['log_count'] or stealer['target_domains']:
+            boost = min(stealer['confidence_boost'], 35)
+            score += boost
+            ext['stealer_intel'] = stealer
+            log.debug(f"  Stealer: {stealer['families']} +{boost}pts "
+                      f"geo:{stealer['geo_tags']} targets:{stealer['target_domains'][:3]}")
+
+    # ── Deep message intel (creds, C2, tools, actor handles) ──────────────────
+    if HAS_MESSAGE_INTEL:
+        intel = extract_message_intel(text)
+        if intel:
+            ext['message_intel'] = intel
+            if intel.get('cred_samples'):
+                score += 15
+            if intel.get('c2_ips') or intel.get('c2_domains'):
+                score += 20
+            if intel.get('tool_files') or intel.get('github_links'):
+                score += 10
+            if intel.get('cred_count', 0) >= 10:
+                score += 10
+
     return score >= 35, min(score, 100), ext
 
 # ── Database ───────────────────────────────────────────────────────────────────
@@ -152,6 +201,7 @@ def ensure_tables():
         has_leak     INTEGER DEFAULT 0,
         confidence   INTEGER DEFAULT 0,
         processed    INTEGER DEFAULT 0,
+        stealer_intel TEXT DEFAULT NULL,
         UNIQUE(channel_id, message_id)
     );
     CREATE TABLE IF NOT EXISTS telegram_channels (
@@ -170,41 +220,83 @@ def ensure_tables():
     CREATE INDEX IF NOT EXISTS idx_tg_has_leak ON telegram_messages(has_leak);
     CREATE INDEX IF NOT EXISTS idx_tg_channel  ON telegram_messages(channel_id);
     ''')
-    # Add channel_id column if missing (migration)
-    cols = [r[1] for r in con.execute("PRAGMA table_info(telegram_channels)").fetchall()]
-    if 'channel_id' not in cols:
+
+    # ── Migrations for existing databases ─────────────────────────────────────
+    cols = [r[1] for r in con.execute(
+        "PRAGMA table_info(telegram_messages)").fetchall()]
+    if 'stealer_intel' not in cols:
+        con.execute(
+            "ALTER TABLE telegram_messages ADD COLUMN stealer_intel TEXT DEFAULT NULL")
+        log.info("Migrated: added stealer_intel column to telegram_messages")
+
+    chan_cols = [r[1] for r in con.execute(
+        "PRAGMA table_info(telegram_channels)").fetchall()]
+    if 'channel_id' not in chan_cols:
         con.execute("ALTER TABLE telegram_channels ADD COLUMN channel_id TEXT")
         log.info("Migrated: added channel_id column")
-    if 'access_hash' not in cols:
+    if 'access_hash' not in chan_cols:
         con.execute("ALTER TABLE telegram_channels ADD COLUMN access_hash TEXT")
         log.info("Migrated: added access_hash column")
+
     con.commit()
     con.close()
 
 def save_message(channel_id, channel_name, msg_id, text, timestamp, is_leak, confidence, extracted):
+    """
+    Save a Telegram message to the DB.
+    extracted dict may contain stealer_intel, cves, sample_emails, etc.
+    """
+    # Serialize stealer intel — only store if something detected
+    stealer_json = None
+    si = extracted.get('stealer_intel')
+    if si and (si.get('families') or si.get('log_count') or si.get('target_domains')):
+        stealer_json = json.dumps(si)
+
+    # Merge message_intel into the same column (unified intel blob)
+    mi = extracted.get('message_intel')
+    if mi:
+        combined = json.loads(stealer_json) if stealer_json else {}
+        combined.update(mi)
+        stealer_json = json.dumps(combined)
+
     con = db()
     try:
         con.execute('''INSERT OR IGNORE INTO telegram_messages
-            (channel_id,channel_name,message_id,text,timestamp,has_leak,confidence,processed)
-            VALUES (?,?,?,?,?,?,?,1)''',
+            (channel_id,channel_name,message_id,text,timestamp,
+             has_leak,confidence,processed,stealer_intel)
+            VALUES (?,?,?,?,?,?,?,1,?)''',
             (str(channel_id), channel_name, msg_id,
-             text[:2000], timestamp, 1 if is_leak else 0, confidence))
+             text[:2000], timestamp, 1 if is_leak else 0,
+             confidence, stealer_json))
+
         if is_leak and confidence >= 45:
             url = f"https://t.me/{channel_name}/{msg_id}"
+
+            # Build descriptive title with all detected intel types
+            parts = []
+            if si and si.get('families'):
+                parts.append('/'.join(si['families'][:2]))
+            if mi and mi.get('tool_categories'):
+                parts.append('+'.join(mi['tool_categories'][:2]))
+            if mi and mi.get('c2_ips'):
+                parts.append('C2')
+            if mi and mi.get('attributed_to'):
+                parts.append(f"actor:{mi['attributed_to'][0]}")
+            prefix = f"[{', '.join(parts)}]" if parts else "[Telegram]"
+            title  = f"{prefix} {channel_name}: {text[:60]}..."
+
             con.execute('''INSERT OR IGNORE INTO leaks
                 (url,title,confidence,full_text,cves,breach_targets,
                  record_counts,has_emails,has_hashes,has_ssn,has_magnet,timestamp)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (url,
-                 f"[Telegram] {channel_name}: {text[:60]}...",
-                 confidence, text[:2000],
-                 json.dumps(extracted.get('cves',[])),
-                 json.dumps(extracted.get('breach_targets',[])),
-                 json.dumps(extracted.get('record_counts',[])),
-                 1 if extracted.get('sample_emails') else 0,
-                 1 if extracted.get('hash_count') else 0,
-                 1 if extracted.get('has_ssn') else 0,
-                 1 if extracted.get('has_magnet') else 0,
+                (url, title, confidence, text[:2000],
+                 json.dumps(extracted.get('cves', [])),
+                 json.dumps(extracted.get('breach_targets', [])),
+                 json.dumps(extracted.get('record_counts', [])),
+                 1 if extracted.get('sample_emails') or (mi and mi.get('cred_samples')) else 0,
+                 1 if extracted.get('hash_count')    else 0,
+                 1 if extracted.get('has_ssn')       else 0,
+                 1 if extracted.get('has_magnet')    else 0,
                  timestamp))
         con.commit()
     except Exception as e:
@@ -238,7 +330,6 @@ def mark_inactive(url):
     con.close()
 
 def get_pending_channels():
-    """Get channels not yet joined, with any stored channel_id and access_hash."""
     con = db()
     rows = con.execute(
         "SELECT url, name, channel_id, access_hash FROM telegram_channels "
@@ -248,7 +339,6 @@ def get_pending_channels():
     return [dict(r) for r in rows]
 
 def get_joined_channels():
-    """Get all joined channels with stored IDs and access hashes."""
     con = db()
     rows = con.execute(
         "SELECT url, name, channel_id, access_hash FROM telegram_channels "
@@ -270,14 +360,17 @@ async def safe_get_entity(client, ch, delay=True):
     Priority order (least API calls first):
     1. InputPeerChannel(id, access_hash) — zero API calls, instant
     2. PeerChannel(id) — minimal API call
-    3. URL lookup — full API call, most likely to rate limit
+    3a. Invite hash URLs (t.me/+HASH or t.me/joinchat/HASH) — ImportChatInviteRequest
+    3b. Public username URL — get_entity()
 
     Returns entity or None.
     """
     from telethon.tl.types import InputPeerChannel
-    cid  = ch.get('channel_id')
+    from telethon.tl.functions.messages import ImportChatInviteRequest
+
+    cid   = ch.get('channel_id')
     ahash = ch.get('access_hash')
-    url  = ch.get('url', '')
+    url   = ch.get('url', '')
 
     # Option 1: Both ID and access_hash stored — zero API call needed
     if cid and ahash and str(cid).lstrip('-').isdigit() and str(ahash).lstrip('-').isdigit():
@@ -286,7 +379,7 @@ async def safe_get_entity(client, ch, delay=True):
                 InputPeerChannel(abs(int(cid)), int(ahash)))
             return entity
         except Exception:
-            pass  # Fall through
+            pass
 
     # Option 2: ID only — one lightweight API call
     if cid and str(cid).lstrip('-').isdigit():
@@ -298,14 +391,46 @@ async def safe_get_entity(client, ch, delay=True):
             await asyncio.sleep(e.seconds + FLOOD_BUFFER)
             return None
         except Exception:
-            pass  # Fall through to URL lookup
+            pass
 
-    # URL lookup — slower, more API calls
     if not url:
         return None
+
+    if delay:
+        await asyncio.sleep(JOIN_DELAY)
+
+    # Option 3a: Invite hash URLs
+    invite_match = re.search(r't\.me/(?:joinchat/|\+)([A-Za-z0-9_\-]+)', url)
+    if invite_match:
+        invite_hash = invite_match.group(1)
+        try:
+            updates = await client(ImportChatInviteRequest(invite_hash))
+            if updates.chats:
+                entity = updates.chats[0]
+                log.info(f"Joined via invite link: {getattr(entity, 'title', url)}")
+                return entity
+            return None
+        except UserAlreadyParticipantError:
+            try:
+                entity = await client.get_entity(url)
+                return entity
+            except Exception:
+                return None
+        except FloodWaitError as e:
+            log.warning(f"Flood wait {e.seconds}s on invite join {url}")
+            await asyncio.sleep(e.seconds + FLOOD_BUFFER)
+            return None
+        except InviteHashExpiredError:
+            log.info(f"Invite link expired/invalid: {url}")
+            mark_inactive(url)
+            return None
+        except Exception as e:
+            log.warning(f"Invite join failed {url}: {e}")
+            mark_inactive(url)
+            return None
+
+    # Option 3b: Public username URL
     try:
-        if delay:
-            await asyncio.sleep(JOIN_DELAY)
         entity = await client.get_entity(url)
         return entity
     except FloodWaitError as e:
@@ -318,13 +443,13 @@ async def safe_get_entity(client, ch, delay=True):
         mark_inactive(url)
         return None
     except UserAlreadyParticipantError:
-        # Already a member — just get the entity
         try:
             entity = await client.get_entity(url)
             return entity
-        except: return None
+        except Exception:
+            return None
     except Exception as e:
-        log.debug(f"Join error {url}: {e}")
+        log.warning(f"Join error {url}: {e}")
         return None
 
 # ── Main monitor ───────────────────────────────────────────────────────────────
@@ -344,6 +469,11 @@ async def run_monitor():
 
     ensure_tables()
 
+    if HAS_STEALER_DETECTION:
+        log.info("Stealer family detection: ENABLED")
+    else:
+        log.info("Stealer family detection: DISABLED (missing stealer_detection.py)")
+
     # Seed channels from cti_seeds.json
     try:
         seeds = json.loads(SEEDS_FILE.read_text())
@@ -351,7 +481,7 @@ async def run_monitor():
             save_channel(url, url.split('/')[-1], 'infostealer')
         for url in seeds.get('telegram_threat_actors', []):
             save_channel(url, url.split('/')[-1], 'threat_actor')
-        log.info(f"Seeds loaded from cti_seeds.json")
+        log.info("Seeds loaded from cti_seeds.json")
     except Exception as e:
         log.warning(f"Could not load cti_seeds.json: {e}")
 
@@ -359,12 +489,49 @@ async def run_monitor():
     await client.start()
     log.info("Telegram client connected")
 
-    # ── Step 1: Load joined channels via get_dialogs() ──────────────────────────
-    # This is ONE API call that returns ALL channels you're a member of.
-    # Zero per-channel API calls. Zero flood risk.
+    # ── Live handler — registered FIRST so no messages are missed during
+    #    history/join phases which can take hours with 200+ pending channels ──────
+    @client.on(events.NewMessage)
+    async def handler(event):
+        if not event.text: return
+        try:
+            chat = await event.get_chat()
+            name = getattr(chat, 'title', str(chat.id))
+            is_leak, conf, extracted = analyze_message(event.text)
+            ts = int(time.time())
+            save_message(chat.id, name, event.id,
+                         event.text, ts, is_leak, conf, extracted)
+            discover_new_channels(extracted, name)
+            if is_leak:
+                si    = extracted.get('stealer_intel', {})
+                mi    = extracted.get('message_intel', {})
+                parts = []
+                if si.get('families'):      parts.append(f"families:{','.join(si['families'])}")
+                if mi.get('c2_ips'):        parts.append(f"C2:{mi['c2_ips'][0]}")
+                if mi.get('c2_domains'):    parts.append(f"C2:{mi['c2_domains'][0]}")
+                if mi.get('tool_files'):    parts.append(f"tool:{mi['tool_files'][0]}")
+                if mi.get('github_links'):  parts.append(f"gh:{mi['github_links'][0]}")
+                if mi.get('attributed_to'): parts.append(f"actor:{mi['attributed_to'][0]}")
+                if mi.get('cred_count'):    parts.append(f"creds:{mi['cred_count']}")
+                detail = ' | '.join(parts) if parts else event.text[:60]
+                log.info(f"[LIVE LEAK {conf}%] {name} | {detail}")
+            con = db()
+            con.execute('''UPDATE telegram_channels SET
+                message_count=message_count+1, last_message=?
+                WHERE channel_id=?''', (ts, str(chat.id)))
+            con.commit()
+            con.close()
+        except Exception as e:
+            import traceback
+            log.warning(f"Handler error: {e}\n{traceback.format_exc()}")
+
+    log.info("Live handler registered — capturing messages through all startup phases")
+
+    # ── Step 1: Load joined channels via get_dialogs() ─────────────────────────
     log.info("Loading joined channels via get_dialogs() (one API call)...")
-    monitoring = []
-    dialog_map = {}  # channel_id -> entity
+    monitoring  = []
+    dialog_map  = {}
+    stealer_hits = 0
 
     try:
         async for dialog in client.iter_dialogs():
@@ -375,7 +542,6 @@ async def run_monitor():
             title = getattr(entity, 'title', str(cid))
             dialog_map[cid] = entity
             monitoring.append(entity)
-            # Store/update channel_id and access_hash in DB
             con = db()
             con.execute(
                 "UPDATE telegram_channels SET channel_id=?, access_hash=?, joined=1 "
@@ -391,9 +557,10 @@ async def run_monitor():
 
     log.info(f"Loaded {len(monitoring)} channels from dialogs")
 
-    # ── Step 2: Process recent history for loaded channels ─────────────────────
+    # ── Step 2: Process recent history ────────────────────────────────────────
     if monitoring:
-        log.info(f"Processing last {HISTORY_LIMIT} messages from {len(monitoring)} channels...")
+        log.info(f"Processing last {HISTORY_LIMIT} messages from "
+                 f"{len(monitoring)} channels...")
         import gc
         total_msgs  = 0
         total_leaks = 0
@@ -410,18 +577,27 @@ async def run_monitor():
                     total_msgs += 1
                     if is_leak:
                         total_leaks += 1
-                        log.info(f"[LEAK {conf}%] {name}: {msg.text[:80]}")
+                        si = extracted.get('stealer_intel', {})
+                        families = si.get('families', [])
+                        if families:
+                            stealer_hits += 1
+                            log.info(f"[LEAK {conf}% | {', '.join(families)}] "
+                                     f"{name}: {msg.text[:70]}")
+                        else:
+                            log.info(f"[LEAK {conf}%] {name}: {msg.text[:80]}")
                         discover_new_channels(extracted, name)
 
                 con = db()
-                con.execute("UPDATE telegram_channels SET last_message=? WHERE channel_id=?",
-                            (int(time.time()), str(entity.id)))
+                con.execute(
+                    "UPDATE telegram_channels SET last_message=? WHERE channel_id=?",
+                    (int(time.time()), str(entity.id)))
                 con.commit()
                 con.close()
 
                 if (i + 1) % 20 == 0:
                     log.info(f"History: {i+1}/{len(monitoring)} channels, "
-                             f"{total_msgs} messages, {total_leaks} leaks")
+                             f"{total_msgs} msgs, {total_leaks} leaks, "
+                             f"{stealer_hits} stealer hits")
                     gc.collect()
                     await asyncio.sleep(10)
                 else:
@@ -436,9 +612,10 @@ async def run_monitor():
 
         monitoring.clear()
         gc.collect()
-        log.info(f"History done: {total_msgs} messages, {total_leaks} leaks")
+        log.info(f"History done: {total_msgs} msgs, {total_leaks} leaks, "
+                 f"{stealer_hits} stealer family detections")
 
-    # ── Step 3: Join pending channels slowly ───────────────────────────────────
+    # ── Step 3: Join pending channels slowly ──────────────────────────────────
     pending = get_pending_channels()
     log.info(f"{len(pending)} channels pending to join")
     log.info(f"Join rate: {JOIN_DELAY}s per channel, "
@@ -448,45 +625,20 @@ async def run_monitor():
     for i, ch in enumerate(pending):
         entity = await safe_get_entity(client, ch, delay=True)
         if entity:
-            # Store both channel_id AND access_hash for future zero-API-call lookups
             ahash = getattr(entity, 'access_hash', None)
             mark_joined(ch['url'], entity.id, ahash)
             joined_count += 1
-            log.info(f"[{i+1}/{len(pending)}] Joined: {getattr(entity,'title',ch['url'])}")
+            log.info(f"[{i+1}/{len(pending)}] Joined: "
+                     f"{getattr(entity,'title',ch['url'])}")
 
-        # Batch pause
         if (i + 1) % JOIN_BATCH_SIZE == 0:
             log.info(f"Joined {joined_count} so far — pausing {JOIN_BATCH_PAUSE}s...")
             await asyncio.sleep(JOIN_BATCH_PAUSE)
 
     log.info(f"Joining complete: {joined_count} new channels joined")
 
-    # ── Step 4: Live monitoring ────────────────────────────────────────────────
-    log.info("Listening for new messages...")
-
-    @client.on(events.NewMessage)
-    async def handler(event):
-        if not event.text: return
-        try:
-            chat = await event.get_chat()
-            name = getattr(chat, 'title', str(chat.id))
-            is_leak, conf, extracted = analyze_message(event.text)
-            ts = int(time.time())
-            save_message(chat.id, name, event.id,
-                         event.text, ts, is_leak, conf, extracted)
-            # Discover new channels from any message (not just leaks)
-            discover_new_channels(extracted, name)
-            if is_leak:
-                log.info(f"[LIVE LEAK {conf}%] {name}: {event.text[:80]}")
-            con = db()
-            con.execute('''UPDATE telegram_channels SET
-                message_count=message_count+1, last_message=?
-                WHERE channel_id=?''', (ts, str(chat.id)))
-            con.commit()
-            con.close()
-        except Exception as e:
-            log.debug(f"Handler error: {e}")
-
+    # ── All startup phases complete — handler already active since startup ─────
+    log.info("Startup complete — live monitoring active")
     await client.run_until_disconnected()
 
 
