@@ -837,12 +837,85 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        """Handle POST requests — webhook receives canarytoken alerts."""
+        """Handle POST requests -- file uploads and webhook alerts."""
         if self.path.startswith("/webhook/"):
             self.do_GET()
-        else:
-            self.send_response(405)
-            self.end_headers()
+            return
+
+        if self.path == "/api/archive_import/upload":
+            import uuid as _uuid, re as _re
+            ct = self.headers.get("Content-Type", "")
+            if "multipart/form-data" not in ct:
+                self.send_json({"ok": False, "reason": "Expected multipart/form-data"}, 400)
+                return
+            try:
+                m = _re.search(r'boundary=([^\s;]+)', ct)
+                if not m:
+                    self.send_json({"ok": False, "reason": "No boundary in Content-Type"}, 400)
+                    return
+                boundary = m.group(1).strip('"').encode()
+                length   = int(self.headers.get("Content-Length", 0))
+                body     = self.rfile.read(length)
+                fields, file_bytes, file_name = {}, None, None
+                for part in body.split(b"--" + boundary)[1:]:
+                    if part.startswith(b"--"):
+                        break
+                    if b"\r\n\r\n" not in part:
+                        continue
+                    raw_hdrs, part_body = part.split(b"\r\n\r\n", 1)
+                    if part_body.endswith(b"\r\n"):
+                        part_body = part_body[:-2]
+                    hdr = raw_hdrs.decode("utf-8", errors="replace")
+                    name_m  = _re.search(r'name="([^"]+)"', hdr, _re.I)
+                    fname_m = _re.search(r'filename="([^"]*)"', hdr, _re.I)
+                    if not name_m:
+                        continue
+                    if fname_m:
+                        file_name  = Path(fname_m.group(1)).name
+                        file_bytes = part_body
+                    else:
+                        fields[name_m.group(1)] = part_body.decode("utf-8", errors="replace")
+                if not file_bytes or not file_name:
+                    self.send_json({"ok": False, "reason": "No file received"}, 400)
+                    return
+                victim_name = fields.get("victim_name", "").strip()
+                actor       = fields.get("actor", "unknown").strip() or "unknown"
+                leak_name   = fields.get("leak_name", "").strip() or Path(file_name).stem
+                source_type = fields.get("source_type", "archive").strip() or "archive"
+                upload_dir  = BASE_DIR / "stealer_uploads"
+                upload_dir.mkdir(exist_ok=True)
+                safe_name = f"{int(time.time())}_{_uuid.uuid4().hex[:6]}_{file_name}"
+                (upload_dir / safe_name).write_bytes(file_bytes)
+                ensure_leak_archive_tables()
+                con = db()
+                try:
+                    cur = con.execute("""
+                        INSERT INTO leak_archives
+                        (download_url, victim_name, actor, leak_name, source_type,
+                         local_path, status)
+                        VALUES (?, ?, ?, ?, ?, ?, 'queued')
+                    """, (f"local://{safe_name}", victim_name, actor, leak_name,
+                          source_type, str(upload_dir / safe_name)))
+                    job_id = cur.lastrowid
+                    con.commit()
+                    worker_res = start_leak_archive_worker(job_id)
+                    if not worker_res.get("ok"):
+                        con.execute("UPDATE leak_archives SET status='worker_missing', error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                                    (worker_res.get("reason"), job_id))
+                        con.commit()
+                        self.send_json({"ok": False, "job_id": job_id, "reason": worker_res.get("reason")}, 500)
+                        return
+                    self.send_json({"ok": True, "job_id": job_id, "filename": safe_name})
+                except Exception as e:
+                    self.send_json({"ok": False, "reason": str(e)}, 500)
+                finally:
+                    con.close()
+            except Exception as e:
+                self.send_json({"ok": False, "reason": str(e)}, 500)
+            return
+
+        self.send_response(405)
+        self.end_headers()
 
     def do_GET(self):
         p  = urlparse(self.path)
@@ -1119,6 +1192,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "job_id": job_id, "reason": worker_res.get("reason")}, 500)
                     return
                 self.send_json({"ok": True, "job_id": job_id})
+            except Exception as e:
+                self.send_json({"ok": False, "reason": str(e)}, 500)
+            finally:
+                con.close()
+
+        elif p.path == "/api/archive_import/update":
+            ensure_leak_archive_tables()
+            job_id = g("id", "").strip()
+            if not job_id:
+                self.send_json({"ok": False, "reason": "Missing id"}, 400); return
+            updates = {k: v for k, v in {
+                "victim_name": g("victim_name"),
+                "actor":       g("actor"),
+                "leak_name":   g("leak_name"),
+            }.items() if qs.get(k) is not None}
+            if not updates:
+                self.send_json({"ok": False, "reason": "No fields to update"}, 400); return
+            con = db()
+            try:
+                set_clause = ", ".join(f"{k}=?" for k in updates)
+                con.execute(
+                    f"UPDATE leak_archives SET {set_clause}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    list(updates.values()) + [job_id]
+                )
+                con.commit()
+                self.send_json({"ok": True})
             except Exception as e:
                 self.send_json({"ok": False, "reason": str(e)}, 500)
             finally:
@@ -3332,6 +3431,40 @@ body::after {
           <button class="btn primary" onclick="queueArchiveImport()">Queue + Start</button>
         </div>
       </div>
+      <!-- Upload from PC -->
+      <div style="padding:12px 20px;border-bottom:1px solid var(--border);background:rgba(16,185,129,0.03);flex-shrink:0;">
+        <div style="font-size:11px;font-weight:600;color:var(--green);text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;">Upload from PC</div>
+        <div style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr 140px auto;gap:8px;align-items:end;">
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">File (.zip .tar.gz .txt .csv .sql)</div>
+            <input type="file" id="archiveUploadFile" class="select" style="width:100%;padding:3px 8px;cursor:pointer;">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">Victim</div>
+            <input class="select" style="width:100%;" id="archiveUploadVictim" placeholder="victim">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">Actor</div>
+            <input class="select" style="width:100%;" id="archiveUploadActor" placeholder="unknown">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">Leak Name</div>
+            <input class="select" style="width:100%;" id="archiveUploadLeakName" placeholder="auto from filename">
+          </div>
+          <div>
+            <div style="font-size:11px;color:var(--text-3);margin-bottom:4px;">Type</div>
+            <select class="select" style="width:100%;" id="archiveUploadSourceType">
+              <option value="archive">archive</option>
+              <option value="csv">csv</option>
+              <option value="txt">txt</option>
+              <option value="json">json</option>
+              <option value="sql">sql</option>
+            </select>
+          </div>
+          <button class="btn success" onclick="uploadArchiveFile()" id="archiveUploadBtn">Upload + Start</button>
+        </div>
+        <div id="archiveUploadProgress" style="margin-top:6px;font-size:11px;color:var(--text-3);display:none;"></div>
+      </div>
       <div class="panel-scroll" style="padding:0;" id="archiveImportWrap"></div>
     </div>
 
@@ -3974,6 +4107,58 @@ async function rerunArchiveJob(id){
   loadArchiveImport();
 }
 
+async function uploadArchiveFile(){
+  const fileInput = document.getElementById('archiveUploadFile');
+  if(!fileInput.files.length){ toast('Select a file first', 'error'); return; }
+  const file = fileInput.files[0];
+  const prog = document.getElementById('archiveUploadProgress');
+  const btn  = document.getElementById('archiveUploadBtn');
+  btn.disabled = true;
+  prog.style.display = '';
+  prog.textContent = 'Uploading ' + file.name + ' (' + (file.size/1024/1024).toFixed(1) + ' MB)...';
+  const fd = new FormData();
+  fd.append('file',        file);
+  fd.append('victim_name', document.getElementById('archiveUploadVictim').value.trim());
+  fd.append('actor',       document.getElementById('archiveUploadActor').value.trim() || 'unknown');
+  fd.append('leak_name',   document.getElementById('archiveUploadLeakName').value.trim());
+  fd.append('source_type', document.getElementById('archiveUploadSourceType').value);
+  try {
+    const res = await fetch('/api/archive_import/upload', {method:'POST', body:fd}).then(r=>r.json());
+    if(res.ok){
+      toast('Uploaded & queued job #' + res.job_id, 'success');
+      fileInput.value='';
+      document.getElementById('archiveUploadVictim').value='';
+      document.getElementById('archiveUploadActor').value='';
+      document.getElementById('archiveUploadLeakName').value='';
+      prog.style.display='none';
+      loadArchiveImport();
+    } else {
+      prog.textContent = 'Error: ' + (res.reason || 'upload failed');
+      toast(res.reason || 'Upload failed', 'error', 5000);
+    }
+  } catch(e){
+    prog.textContent = 'Network error: ' + e;
+    toast('Upload failed: ' + e, 'error', 5000);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function editArchiveJob(id, currentVictim, currentActor, currentLeak){
+  const victim = prompt('Victim name:', currentVictim || '');
+  if(victim === null) return;
+  const actor  = prompt('Actor / threat group:', currentActor || 'unknown');
+  if(actor  === null) return;
+  const leak   = prompt('Leak name / label:', currentLeak || '');
+  if(leak   === null) return;
+  const params = new URLSearchParams({
+    id, victim_name: victim.trim(), actor: actor.trim() || 'unknown', leak_name: leak.trim()
+  });
+  const res = await fetch('/api/archive_import/update?' + params).then(r=>r.json()).catch(e=>({ok:false,reason:String(e)}));
+  if(res.ok){ toast('Job #' + id + ' updated', 'success'); loadArchiveImport(); }
+  else toast(res.reason || 'Update failed', 'error', 4500);
+}
+
 async function loadArchiveImport(){
   const wrap = document.getElementById('archiveImportWrap');
   if(!wrap) return;
@@ -4006,6 +4191,7 @@ async function loadArchiveImport(){
       <td class="td-actions">
         <button class="row-btn" onclick="showArchiveFiles(${j.id})">files</button>
         <button class="row-btn" onclick="rerunArchiveJob(${j.id})">run</button>
+        <button class="row-btn" style="color:var(--amber);" onclick="editArchiveJob(${j.id},${JSON.stringify(j.victim_name||'')},${JSON.stringify(j.actor||'unknown')},${JSON.stringify(j.leak_name||'')})">edit</button>
       </td>
     </tr>
     <tr id="archiveFiles_${j.id}" style="display:none;"><td colspan="10" style="padding:0;background:rgba(59,130,246,0.03);"></td></tr>`;
