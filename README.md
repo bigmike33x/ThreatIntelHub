@@ -84,8 +84,8 @@ You are responsible for complying with all applicable laws, terms of service, an
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/bigmike33x/dark-crawler.git
-cd dark-crawler
+https://github.com/bigmike33x/ThreatIntelHub.git
+cd ThreatIntelHub
 ```
 
 If you rename the GitHub repo later, update the clone URL and your local `origin`.
