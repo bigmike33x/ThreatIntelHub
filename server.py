@@ -942,17 +942,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"leaks":leaks_c,"unseen_alerts":unseen,
                            "tg_messages":tg_msg,"tg_leaks":tg_leak})
 
-
-
-            self.send_json([{
-                "mirror_group": g2["mirror_group"],
-                "count":  g2["count"],
-                "title":  g2["title"],
-                "trust":  g2["trust"],
-                "urls":   g2["urls"].split("|||") if g2["urls"] else [],
-                "ids":    [int(i) for i in g2["ids"].split(",") if i],
-            } for g2 in groups])
-
         elif p.path == "/api/categories":
             con  = db()
             rows = con.execute("SELECT category,COUNT(*) as count FROM sites WHERE noise=0 GROUP BY category ORDER BY count DESC").fetchall()
@@ -1695,18 +1684,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con.commit(); con.close(); self.send_json({"ok":True})
 
         elif p.path == "/api/ransomware/groups":
-            import urllib.request as _ur
+            import http.client as _hc, ssl as _ssl
             try:
-                req = _ur.Request(
-                    "https://api-pro.ransomware.live/groups",
-                    headers={"accept":"application/json","X-API-KEY":RANSOMWARE_LIVE_API_KEY}
-                )
-                with _ur.urlopen(req, timeout=20) as resp:
-                    self.send_response(200)
-                    self.send_header("Content-Type","application/json")
-                    self.send_header("Access-Control-Allow-Origin","*")
-                    self.end_headers()
-                    self.wfile.write(resp.read())
+                _key = os.environ.get("RANSOMWARE_LIVE_API_KEY", RANSOMWARE_LIVE_API_KEY)
+                _ctx = _ssl.create_default_context()
+                _conn = _hc.HTTPSConnection("api-pro.ransomware.live", timeout=20, context=_ctx)
+                _conn.request("GET", "/groups", headers={"accept":"application/json","X-Api-Key":_key})
+                _resp = _conn.getresponse()
+                _body = _resp.read()
+                _conn.close()
+                self.send_response(_resp.status)
+                self.send_header("Content-Type","application/json")
+                self.send_header("Access-Control-Allow-Origin","*")
+                self.end_headers()
+                self.wfile.write(_body)
             except Exception as e:
                 self.send_json({"error": str(e)}, 502)
 
@@ -1737,18 +1728,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             name = g("name","").strip().lower()
             if not name:
                 self.send_json({"error":"missing name"}, 400); return
-            import urllib.request as _ur
+            import http.client as _hc, ssl as _ssl
             try:
-                req = _ur.Request(
-                    f"https://api-pro.ransomware.live/groups/{name}",
-                    headers={"accept":"application/json","X-API-KEY":RANSOMWARE_LIVE_API_KEY}
-                )
-                with _ur.urlopen(req, timeout=20) as resp:
-                    self.send_response(200)
-                    self.send_header("Content-Type","application/json")
-                    self.send_header("Access-Control-Allow-Origin","*")
-                    self.end_headers()
-                    self.wfile.write(resp.read())
+                _key = os.environ.get("RANSOMWARE_LIVE_API_KEY", RANSOMWARE_LIVE_API_KEY)
+                _ctx = _ssl.create_default_context()
+                _conn = _hc.HTTPSConnection("api-pro.ransomware.live", timeout=20, context=_ctx)
+                _conn.request("GET", f"/groups/{name}", headers={"accept":"application/json","X-Api-Key":_key})
+                _resp = _conn.getresponse()
+                _body = _resp.read()
+                _conn.close()
+                self.send_response(_resp.status)
+                self.send_header("Content-Type","application/json")
+                self.send_header("Access-Control-Allow-Origin","*")
+                self.end_headers()
+                self.wfile.write(_body)
             except Exception as e:
                 self.send_json({"error": str(e)}, 502)
 
