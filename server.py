@@ -104,6 +104,104 @@ def content_hash(text):
     normalized = re.sub(r'\s+', ' ', (text or '').lower().strip())[:500]
     return hashlib.md5(normalized.encode()).hexdigest()
 
+VALID_DOMAIN_TLDS = {
+    "com","net","org","edu","gov","mil","io","co","us","uk","ca","de","fr","au",
+    "jp","br","me","biz","info","in","za","nz","nl","it","es","se","no","fi",
+    "dk","ch","be","at","ie","mx","ar","cl","sg","hk","kr","cn","tw","pl","cz",
+    "ru","ua","gr","pt","ro","hu","sk","si","tr","il","ae","sa","id","my","ph",
+    "th","vn","pk","lk","ng","ke","za","co.uk","com.au","com.br","com.co",
+    "co.jp","ac.uk","k12.ny.us","state.ma.us"
+}
+
+def valid_display_entity(value, entity_type):
+    """Filter noisy imported-dump entities before returning them to the UI."""
+    v = str(value or "").strip()
+    t = str(entity_type or "").strip().lower()
+
+    if not v:
+        return False
+
+    low = v.lower()
+
+    if low in {"name", "email", "domain", "phone", "username", "value", "null", "none", "nan"}:
+        return False
+
+    if t in {"name", "unknown"}:
+        return False
+
+    # Avoid CSV/header-looking values.
+    if len(v) < 3:
+        return False
+
+    # Emails are useful even if the local part contains periods or numbers.
+    if t == "email":
+        return "@" in v and "." in v.split("@")[-1]
+
+    # Only keep domains with common/expected TLDs.
+    # This hides dump artifacts like aaron.spencer, metadata.operation, great.course.
+    if t == "domain":
+        if "@" in v or "." not in v:
+            return False
+        parts = low.strip(".").split(".")
+        if len(parts) < 2:
+            return False
+        tld = parts[-1]
+        two_part_tld = ".".join(parts[-2:]) if len(parts) >= 2 else tld
+        three_part_tld = ".".join(parts[-3:]) if len(parts) >= 3 else two_part_tld
+        if tld not in VALID_DOMAIN_TLDS and two_part_tld not in VALID_DOMAIN_TLDS and three_part_tld not in VALID_DOMAIN_TLDS:
+            return False
+        return bool(re.match(r"^(?:[a-z0-9-]+\.)+[a-z0-9-]{2,24}$", low, re.I))
+
+    return True
+
+def prettify_leak_name(leak_name):
+    """Convert internal archive/import labels into user-facing breach names."""
+    raw = str(leak_name or "").strip()
+    if not raw or raw.lower() in {"unknown", "none", "null"}:
+        return "Unknown Breach"
+
+    name = raw
+    name = re.sub(r"^shouldve[_\-\s]*paid[_\-\s]*the[_\-\s]*ransom[_\-\s]*", "", name, flags=re.I)
+    name = re.sub(r"[_\-]+", " ", name).strip()
+    key = re.sub(r"\s+", " ", name.lower()).strip()
+
+    special_cases = {
+        "harvard shinyhunters": "Harvard Breach",
+        "7eleven shinyhunters": "7-Eleven Breach",
+        "7 eleven shinyhunters": "7-Eleven Breach",
+        "adt shinyhunters": "ADT Breach",
+        "ticketmaster shinyhunters": "Ticketmaster Breach",
+        "att snowflake": "AT&T Breach",
+        "at&t snowflake": "AT&T Breach",
+    }
+    if key in special_cases:
+        return special_cases[key]
+
+    # If actor is appended, keep the victim/company as the source label.
+    known_actors = {"shinyhunters", "snowflake", "thefallen", "lockbit", "clop", "alphv", "blackcat"}
+    parts = key.split()
+    display_parts = []
+    for part in parts:
+        if part in known_actors:
+            break
+        display_parts.append(part)
+
+    if not display_parts and parts:
+        display_parts = [parts[0]]
+
+    label = " ".join(display_parts).strip()
+    if not label:
+        return "Unknown Breach"
+
+    # Preserve common brand styling.
+    if label.replace(" ", "") == "7eleven":
+        return "7-Eleven Breach"
+    if label == "att":
+        return "AT&T Breach"
+
+    return f"{label.title()} Breach"
+
+
 def trust_score(site):
     """
     Trust score on top of base score:
@@ -993,18 +1091,83 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     cols = {r[1] for r in con.execute("PRAGMA table_info(exposure_entities)").fetchall()}
                     value_col = "value_plain" if "value_plain" in cols else ("value" if "value" in cols else None)
                     type_col = "entity_type" if "entity_type" in cols else ("type" if "type" in cols else None)
-                    times_col = "times_seen" if "times_seen" in cols else None
+                    id_col = "id" if "id" in cols else None
+                    normalized_col = "normalized_value" if "normalized_value" in cols else None
+
                     if value_col:
-                        select_cols = [f"{value_col} AS value"]
-                        select_cols.append(f"{type_col} AS entity_type" if type_col else "'unknown' AS entity_type")
-                        select_cols.append(f"{times_col} AS times_seen" if times_col else "1 AS times_seen")
-                        if "id" in cols:
-                            select_cols.append("id")
-                        rows = con.execute(
-                            f"SELECT {', '.join(select_cols)} FROM exposure_entities WHERE {value_col} LIKE ? ORDER BY times_seen DESC LIMIT 100",
-                            (like,)
-                        ).fetchall()
-                        exposures = [dict(r) for r in rows]
+                        search_where = f"(ee.{value_col} LIKE ?"
+                        params = [like]
+                        if normalized_col:
+                            search_where += f" OR ee.{normalized_col} LIKE ?"
+                            params.append(like)
+                        search_where += ")"
+
+                        if id_col and table_exists(con, "exposure_occurrences"):
+                            occ_cols = {r[1] for r in con.execute("PRAGMA table_info(exposure_occurrences)").fetchall()}
+                            has_entity_id = "entity_id" in occ_cols
+                            has_archive_id = "archive_id" in occ_cols
+                            has_leak_archives = table_exists(con, "leak_archives")
+
+                            join_sql = ""
+                            source_expr = "'unknown'"
+
+                            if has_entity_id:
+                                join_sql += f" LEFT JOIN exposure_occurrences eo ON eo.entity_id = ee.{id_col}"
+                                source_expr = "COALESCE(NULLIF(eo.leak_name,''), NULLIF(eo.victim_name,''), 'unknown')"
+
+                                if has_archive_id and has_leak_archives:
+                                    la_cols = {r[1] for r in con.execute("PRAGMA table_info(leak_archives)").fetchall()}
+                                    join_sql += " LEFT JOIN leak_archives la ON la.id = eo.archive_id"
+                                    archive_source_parts = []
+                                    if "leak_name" in la_cols:
+                                        archive_source_parts.append("NULLIF(la.leak_name,'')")
+                                    if "victim_name" in la_cols:
+                                        archive_source_parts.append("NULLIF(la.victim_name,'')")
+                                    if archive_source_parts:
+                                        source_expr = "COALESCE(NULLIF(eo.leak_name,''), " + ", ".join(archive_source_parts) + ", NULLIF(eo.victim_name,''), 'unknown')"
+
+                            rows = con.execute(f"""
+                                SELECT
+                                    ee.{id_col} AS id,
+                                    ee.{value_col} AS value,
+                                    {f"ee.{type_col}" if type_col else "'unknown'"} AS entity_type,
+                                    GROUP_CONCAT(DISTINCT {source_expr}) AS leak_names
+                                FROM exposure_entities ee
+                                {join_sql}
+                                WHERE {search_where}
+                                GROUP BY ee.{id_col}
+                                ORDER BY ee.{value_col}
+                                LIMIT 300
+                            """, params).fetchall()
+
+                            for r in rows:
+                                d = dict(r)
+                                if not valid_display_entity(d.get("value"), d.get("entity_type")):
+                                    continue
+                                raw_leaks = [x.strip() for x in (d.pop("leak_names") or "").split(",") if x.strip()]
+                                friendly = []
+                                for leak in raw_leaks:
+                                    label = prettify_leak_name(leak)
+                                    if label not in friendly:
+                                        friendly.append(label)
+                                d["leaks"] = friendly or ["Unknown Breach"]
+                                exposures.append(d)
+                                if len(exposures) >= 100:
+                                    break
+                        else:
+                            entity_type_select = f"{type_col} AS entity_type" if type_col else "'unknown' AS entity_type"
+                            rows = con.execute(
+                                f"SELECT {value_col} AS value, {entity_type_select} FROM exposure_entities ee WHERE {search_where} ORDER BY {value_col} LIMIT 300",
+                                params
+                            ).fetchall()
+                            for r in rows:
+                                d = dict(r)
+                                if not valid_display_entity(d.get("value"), d.get("entity_type")):
+                                    continue
+                                d["leaks"] = ["Unknown Breach"]
+                                exposures.append(d)
+                                if len(exposures) >= 100:
+                                    break
 
                 leaks = []
                 if table_exists(con, "leaks"):
@@ -4043,15 +4206,25 @@ async function searchPersonal(){
   const el=document.getElementById('isResults-dump');
   el.style.display='block';
   el.innerHTML='<span style="color:var(--accent)">Searching imported dumps, leaks, and Telegram…</span>';
-  const res=await fetch(`/api/intel/search?term=${encodeURIComponent(term)}`).then(r=>r.json()).catch(()=>null);
+  const res=await fetch(`/api/intel/search?term=${encodeURIComponent(term)}&_=${Date.now()}`).then(r=>r.json()).catch(()=>null);
   if(!res){el.innerHTML='Search failed.';return;}
+  if(res.error){
+    el.innerHTML=`<span style="color:var(--red)">Search error: ${esc(res.error)}</span>`;
+    return;
+  }
   if(!res.total){
     el.innerHTML=`<span style="color:var(--accent)">✓ No matches found for "${esc(term)}"</span>`;return;
   }
-  const exposureRows=(res.exposures||[]).slice(0,25).map(r=>`<div style="margin-top:4px;padding:4px 8px;border-left:2px solid var(--red);">
+  const formatLeaks=(leaks)=>{
+    const arr=[...new Set((leaks||[]).filter(Boolean))];
+    if(!arr.length) return '<div style="color:var(--text-3);font-size:11px;margin-bottom:4px;">Leaked From: Unknown Breach</div>';
+    if(arr.length===1) return `<div style="color:var(--text-3);font-size:11px;margin-bottom:4px;">Leaked From: <span style="color:var(--amber);">${esc(arr[0])}</span></div>`;
+    return `<div style="color:var(--text-3);font-size:11px;margin-bottom:4px;">Leaked From:<br>${arr.map(x=>`<span style="color:var(--amber);">• ${esc(x)}</span>`).join('<br>')}</div>`;
+  };
+  const exposureRows=(res.exposures||[]).slice(0,25).map(r=>`<div style="margin-top:6px;padding:6px 8px;border-left:2px solid var(--red);">
+      ${formatLeaks(r.leaks)}
       <span style="color:var(--text)">${esc(r.value||'')}</span>
       <span class="chip chip-red">${esc(r.entity_type||'entity')}</span>
-      <span style="color:var(--text-3);margin-left:8px;">seen ${(r.times_seen||1).toLocaleString()}x</span>
     </div>`).join('');
   const leakRows=(res.leaks||[]).slice(0,10).map(r=>`<div style="margin-top:4px;padding:4px 8px;border-left:2px solid var(--amber);">
       <span style="color:var(--text)">${esc(r.title||'')}</span>
