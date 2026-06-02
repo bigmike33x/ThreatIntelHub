@@ -2006,18 +2006,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p.path == "/api/ransomware/groups":
             import http.client as _hc, ssl as _ssl
             try:
-                _key = os.environ.get("RANSOMWARE_LIVE_API_KEY", RANSOMWARE_LIVE_API_KEY)
+                _key = os.environ.get("RANSOMWARE_LIVE_API_KEY", RANSOMWARE_LIVE_API_KEY).strip()
                 _ctx = _ssl.create_default_context()
-                _conn = _hc.HTTPSConnection("api-pro.ransomware.live", timeout=20, context=_ctx)
-                _conn.request("GET", "/groups", headers={"accept":"application/json","X-Api-Key":_key})
-                _resp = _conn.getresponse()
-                _body = _resp.read()
-                _conn.close()
-                self.send_response(_resp.status)
-                self.send_header("Content-Type","application/json")
-                self.send_header("Access-Control-Allow-Origin","*")
-                self.end_headers()
-                self.wfile.write(_body)
+
+                # Use the public endpoint unless an API key is configured.
+                # If the pro endpoint rejects/changes shape, fall back to public.
+                hosts_to_try = []
+                if _key:
+                    hosts_to_try.append(("api-pro.ransomware.live", {"accept":"application/json","X-Api-Key":_key}))
+                hosts_to_try.append(("api.ransomware.live", {"accept":"application/json"}))
+
+                last_status, last_body = 502, b'{"error":"ransomware.live request failed"}'
+                for _host, _headers in hosts_to_try:
+                    _conn = _hc.HTTPSConnection(_host, timeout=20, context=_ctx)
+                    _conn.request("GET", "/groups", headers=_headers)
+                    _resp = _conn.getresponse()
+                    _body = _resp.read()
+                    _conn.close()
+                    last_status, last_body = _resp.status, _body
+
+                    # Only accept a real JSON array or an object containing groups/data/results.
+                    if 200 <= _resp.status < 300:
+                        try:
+                            _parsed = json.loads(_body.decode("utf-8", errors="replace"))
+                            if isinstance(_parsed, list) or (isinstance(_parsed, dict) and any(k in _parsed for k in ("groups", "data", "results"))):
+                                self.send_json(_parsed)
+                                return
+                        except Exception:
+                            pass
+
+                try:
+                    _msg = json.loads(last_body.decode("utf-8", errors="replace"))
+                except Exception:
+                    _msg = last_body.decode("utf-8", errors="replace")[:500]
+                self.send_json({"error": "ransomware.live /groups did not return a valid groups list", "status": last_status, "details": _msg}, 502)
             except Exception as e:
                 self.send_json({"error": str(e)}, 502)
 
@@ -2050,10 +2072,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error":"missing name"}, 400); return
             import http.client as _hc, ssl as _ssl
             try:
-                _key = os.environ.get("RANSOMWARE_LIVE_API_KEY", RANSOMWARE_LIVE_API_KEY)
+                _key = os.environ.get("RANSOMWARE_LIVE_API_KEY", RANSOMWARE_LIVE_API_KEY).strip()
                 _ctx = _ssl.create_default_context()
-                _conn = _hc.HTTPSConnection("api-pro.ransomware.live", timeout=20, context=_ctx)
-                _conn.request("GET", f"/groups/{name}", headers={"accept":"application/json","X-Api-Key":_key})
+                _host = "api-pro.ransomware.live" if _key else "api.ransomware.live"
+                _headers = {"accept":"application/json"}
+                if _key:
+                    _headers["X-Api-Key"] = _key
+                _conn = _hc.HTTPSConnection(_host, timeout=20, context=_ctx)
+                _conn.request("GET", f"/groups/{name}", headers=_headers)
                 _resp = _conn.getresponse()
                 _body = _resp.read()
                 _conn.close()
@@ -5776,17 +5802,28 @@ async function loadRansomware(force=false) {
       el.innerHTML = `<div class="empty"><div class="empty-icon">⚠️</div>${esc(data.error)}</div>`;
       return;
     }
-    const raw = Array.isArray(data) ? data : (data.groups || Object.values(data));
+    const raw = Array.isArray(data)
+      ? data
+      : (Array.isArray(data.groups) ? data.groups
+      : (Array.isArray(data.data) ? data.data
+      : (Array.isArray(data.results) ? data.results : [])));
+
+    if (!raw.length) {
+      el.innerHTML = `<div class="empty"><div class="empty-icon">⚠️</div>ransomware.live returned no group list</div>`;
+      updateRwStats([]);
+      return;
+    }
+
     // Normalise ALL field names once here — everything else just uses these
-    _rwCache = raw.map(g => ({
+    _rwCache = raw.filter(g => g && typeof g === 'object').map(g => ({
       ...g,
-      name:        g.name        || g.group       || '',
+      name:        g.name        || g.group       || g.group_name || g.slug || '',
       status:      rwNormalizeStatus(g),
       victims:     rwVictimNum(g),
       firstseen:   g.firstseen   || g.first_seen  || '',
-      lastseen:    g.lastseen    || g.last_seen    || '',
+      lastseen:    g.lastseen    || g.last_seen   || '',
       description: g.description || g.summary     || '',
-    }));
+    })).filter(g => g.name);
     updateRwStats(_rwCache);
     renderRwGrid(_rwCache);
   } catch(e) {
