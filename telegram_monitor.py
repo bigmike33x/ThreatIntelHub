@@ -372,6 +372,54 @@ def discover_new_channels(extracted, source):
         name = ch_url.split('/')[-1]
         save_channel(ch_url, name, 'discovered', source)
 
+# ── Telegram artifact filtering ────────────────────────────────────────────────
+ALLOWED_TG_ARTIFACT_EXTS = {
+    ".txt", ".csv", ".json", ".sql", ".log",
+    ".conf", ".xml", ".yaml", ".yml",
+    ".zip", ".7z", ".rar", ".tar", ".gz",
+    ".py", ".php", ".js", ".ps1", ".sh", ".bat",
+    ".exe", ".dll", ".apk"
+}
+
+SKIP_TG_MIME_PREFIXES = (
+    "image/",
+    "video/",
+    "audio/",
+)
+
+SKIP_TG_MIME_TYPES = {
+    "application/x-tgsticker",
+    "application/x-bad-tgsticker",
+}
+
+def should_download_telegram_artifact(filename, mime_type="", size_bytes=0):
+    filename = str(filename or "").strip()
+    mime_type = str(mime_type or "").lower().strip()
+
+    if not filename:
+        return False
+
+    low = filename.lower()
+    ext = Path(low).suffix
+
+    # Skip generic Telegram mystery blobs like telegram_386239.bin.
+    if re.match(r"^telegram_\d+\.bin$", low):
+        return False
+
+    # Skip all .bin files. These are usually unnamed Telegram media/blob noise.
+    if ext == ".bin":
+        return False
+
+    # Skip visible media/stickers that Telegram exposes as files.
+    if any(mime_type.startswith(prefix) for prefix in SKIP_TG_MIME_PREFIXES):
+        return False
+
+    if mime_type in SKIP_TG_MIME_TYPES:
+        return False
+
+    # Only keep useful intel/archive/script file types.
+    return ext in ALLOWED_TG_ARTIFACT_EXTS
+
 def safe_filename(name):
     name = name or "telegram_file.bin"
     name = Path(str(name)).name
@@ -425,6 +473,14 @@ async def download_telegram_artifact(client, msg, channel_id, channel_name):
     filename = safe_filename(getattr(msg.file, 'name', None) or f"telegram_{msg.id}.bin")
     mime_type = getattr(msg.file, 'mime_type', None)
     size_bytes = getattr(msg.file, 'size', None) or 0
+    # Skip useless Telegram media, stickers, thumbnails, and mystery blobs.
+    if not should_download_telegram_artifact(filename, mime_type, size_bytes):
+        log.info(
+            f"[ARTIFACT SKIPPED] {channel_name}/{msg.id} "
+            f"{filename} mime={mime_type} size={size_bytes}"
+        )
+        return None
+
 
     if size_bytes and size_bytes > MAX_ARTIFACT_MB * 1024 * 1024:
         save_artifact_record(channel_id, channel_name, msg.id, filename,
