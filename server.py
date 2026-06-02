@@ -4,7 +4,7 @@ server_v2.py — Dark Crawler dashboard backed by SQLite
 """
 import http.server, socketserver, threading, subprocess
 import os
-import json, sys, sqlite3, time, hashlib, re
+import json, sys, sqlite3, time, hashlib, re, shutil, html, mimetypes
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, quote_plus
 
@@ -336,6 +336,80 @@ def attach_telegram_intel(con, message_rows):
         return messages
 
     return messages
+
+
+def attach_telegram_artifacts(con, message_rows):
+    """Attach downloaded Telegram artifact metadata to Telegram messages for UI buttons."""
+    messages = [dict(m) for m in message_rows]
+    if not messages or not table_exists(con, 'telegram_artifacts'):
+        return messages
+
+    pairs = []
+    for m in messages:
+        m['artifacts'] = []
+        if m.get('channel_id') is not None and m.get('message_id') is not None:
+            pairs.append((str(m.get('channel_id')), int(m.get('message_id'))))
+
+    if not pairs:
+        return messages
+
+    try:
+        where = ' OR '.join(['(channel_id=? AND message_id=?)' for _ in pairs])
+        params = []
+        for channel_id, message_id in pairs:
+            params.extend([channel_id, message_id])
+        rows = con.execute(f"""
+            SELECT id, channel_id, message_id, filename, mime_type, size_bytes,
+                   sha256, local_path, download_status, error, downloaded_at
+            FROM telegram_artifacts
+            WHERE {where}
+            ORDER BY id
+        """, params).fetchall()
+        by_pair = {}
+        for r in rows:
+            d = dict(r)
+            key = (str(d.get('channel_id')), int(d.get('message_id') or 0))
+            # Do not expose local filesystem path to the browser.
+            d.pop('local_path', None)
+            by_pair.setdefault(key, []).append(d)
+        for m in messages:
+            key = (str(m.get('channel_id')), int(m.get('message_id') or 0))
+            m['artifacts'] = by_pair.get(key, [])
+    except Exception:
+        for m in messages:
+            if 'artifacts' not in m:
+                m['artifacts'] = []
+    return messages
+
+
+def get_telegram_artifact_row(artifact_id):
+    con = db()
+    try:
+        if not table_exists(con, 'telegram_artifacts'):
+            return None
+        return con.execute("""
+            SELECT id, channel_id, channel_name, message_id, filename, mime_type,
+                   size_bytes, sha256, local_path, download_status, error, downloaded_at
+            FROM telegram_artifacts
+            WHERE id=?
+        """, (artifact_id,)).fetchone()
+    finally:
+        con.close()
+
+
+def safe_artifact_path(local_path):
+    if not local_path:
+        return None
+    try:
+        path = Path(local_path).expanduser().resolve()
+        base = BASE_DIR.resolve()
+        if path != base and base not in path.parents:
+            return None
+        if not path.exists() or not path.is_file():
+            return None
+        return path
+    except Exception:
+        return None
 
 def ransomware_telegram_correlation(con, group_name):
     """Build read-only Telegram intel correlation for a ransomware group name.
@@ -1455,6 +1529,87 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con.commit(); con.close()
             self.send_json({"ok":True,"removed":removed})
 
+        elif p.path == "/api/telegram_artifact/download":
+            artifact_id = g("id", "").strip()
+            if not artifact_id.isdigit():
+                self.send_error(400, "Missing artifact id")
+                return
+            row = get_telegram_artifact_row(int(artifact_id))
+            if not row:
+                self.send_error(404, "Artifact not found")
+                return
+            path = safe_artifact_path(row["local_path"])
+            if not path:
+                self.send_error(404, "Artifact file missing")
+                return
+
+            filename = Path(row["filename"] or path.name).name
+            ctype = row["mime_type"] or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(path.stat().st_size))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+            return
+
+        elif p.path == "/api/telegram_artifact/preview":
+            artifact_id = g("id", "").strip()
+            if not artifact_id.isdigit():
+                self.send_error(400, "Missing artifact id")
+                return
+            row = get_telegram_artifact_row(int(artifact_id))
+            if not row:
+                self.send_error(404, "Artifact not found")
+                return
+            path = safe_artifact_path(row["local_path"])
+            if not path:
+                self.send_error(404, "Artifact file missing")
+                return
+
+            filename = Path(row["filename"] or path.name).name
+            ext = path.suffix.lower()
+            text_exts = {
+                ".txt", ".csv", ".json", ".log", ".xml", ".html", ".htm",
+                ".md", ".py", ".php", ".js", ".css", ".sh", ".bat", ".ps1",
+                ".conf", ".ini", ".yml", ".yaml", ".sql", ".env"
+            }
+            max_preview = 250_000
+            meta = (
+                f"Filename: {filename}\n"
+                f"Size: {int(row['size_bytes'] or path.stat().st_size):,} bytes\n"
+                f"MIME: {row['mime_type'] or mimetypes.guess_type(filename)[0] or 'unknown'}\n"
+                f"SHA256: {row['sha256'] or 'unknown'}\n\n"
+            )
+
+            if ext in text_exts:
+                try:
+                    data = path.read_text(errors="replace")[:max_preview]
+                    truncated = path.stat().st_size > max_preview
+                    preview = meta + data + ("\n\n--- preview truncated ---" if truncated else "")
+                except Exception as e:
+                    preview = meta + f"Could not read text preview: {e}"
+            else:
+                preview = meta + "Preview is disabled for this file type. Use Download to save the original file."
+
+            body = f"""<!doctype html>
+<html><head><meta charset=\"utf-8\"><title>{html.escape(filename)}</title></head>
+<body style=\"background:#0a0c10;color:#e2e8f0;font-family:ui-monospace,Consolas,monospace;padding:20px;\">
+<div style=\"margin-bottom:12px;\">
+  <a href=\"/api/telegram_artifact/download?id={int(artifact_id)}\" style=\"color:#86efac;text-decoration:none;\">Download original</a>
+</div>
+<pre style=\"white-space:pre-wrap;word-break:break-word;line-height:1.45;\">{html.escape(preview)}</pre>
+</body></html>""".encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         elif p.path == "/api/telegram":
             view = g("view","leaks")  # leaks|all|channels
             q    = g("q")
@@ -1536,7 +1691,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 rows  = con.execute(
                     f"SELECT * FROM telegram_messages {w} ORDER BY timestamp DESC LIMIT ? OFFSET ?",
                     params+[per_page,offset]).fetchall()
-                self.send_json({"messages":attach_telegram_intel(con, rows),"total":total})
+                messages = attach_telegram_intel(con, rows)
+                messages = attach_telegram_artifacts(con, messages)
+                self.send_json({"messages":messages,"total":total})
             finally:
                 con.close()
 
@@ -5306,6 +5463,24 @@ function tgFilterParams(){
   return params.toString();
 }
 
+
+function tgArtifactsHtml(m){
+  const arts = m.artifacts || [];
+  if(!arts.length) return '';
+  return `<div style="margin-top:8px;display:flex;flex-direction:column;gap:5px;">${arts.map(a=>{
+    const name = esc(a.filename || 'telegram_file.bin');
+    const size = a.size_bytes ? ` · ${(a.size_bytes/1024).toFixed(a.size_bytes>1024*1024?0:1)} KB` : '';
+    const status = a.download_status && a.download_status !== 'downloaded' ? ` · ${esc(a.download_status)}` : '';
+    return `<div style="padding:6px 8px;border:1px solid var(--border);border-radius:6px;background:rgba(59,130,246,.05);font-size:12px;">
+      <span style="color:var(--accent-hi);font-weight:600;">[Telegram attachment]</span>
+      <span style="color:var(--text);margin-left:4px;">${name}</span>
+      <span style="color:var(--text-3);font-size:11px;">${size}${status}</span>
+      <a href="/api/telegram_artifact/preview?id=${encodeURIComponent(a.id)}" target="_blank" style="margin-left:10px;color:#7dd3fc;text-decoration:none;">[Preview]</a>
+      <a href="/api/telegram_artifact/download?id=${encodeURIComponent(a.id)}" target="_blank" style="margin-left:6px;color:#86efac;text-decoration:none;">[Download]</a>
+    </div>`;
+  }).join('')}</div>`;
+}
+
 async function loadTelegramStats(){
   const s = await fetch('/api/telegram/stats').then(r=>r.json()).catch(()=>null);
   if(!s) return;
@@ -5374,6 +5549,7 @@ async function loadTelegram(){
          <br><button onclick="toggleTgMsg('${msgId}')" id="${msgId}-btn" style="margin-top:6px;background:none;border:none;color:var(--accent);font-size:11px;cursor:pointer;padding:0;font-family:inherit;">▼ Show more</button>`:''}
          ${tgIntelBadges(m)}
          ${tgIntelDetails(m)}
+         ${tgArtifactsHtml(m)}
        </td>
       <td style="padding-top:14px;white-space:nowrap;">
         ${m.has_leak?`<span class="sev ${sevClass}">${m.confidence}%</span>`:'<span style="color:var(--text-3);font-size:12px;">—</span>'}

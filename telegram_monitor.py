@@ -25,6 +25,7 @@ import os
 import sqlite3
 import time
 import logging
+import hashlib
 from pathlib import Path
 from datetime import timezone
 
@@ -69,6 +70,7 @@ BASE_DIR   = Path(__file__).parent
 DB_PATH    = BASE_DIR / "crawler.db"
 SEEDS_FILE = BASE_DIR / "cti_seeds.json"
 SESSION    = str(BASE_DIR / "tg_monitor_session")
+ARTIFACT_DIR = Path(os.getenv("TG_ARTIFACT_DIR", str(BASE_DIR / "telegram_artifacts")))
 
 # ── Rate limit settings ────────────────────────────────────────────────────────
 JOIN_DELAY       = 15    # seconds between each join attempt
@@ -77,6 +79,7 @@ JOIN_BATCH_SIZE  = 10    # joins per batch
 FLOOD_BUFFER     = 30    # extra seconds added to any flood wait
 HISTORY_LIMIT    = 50    # messages to fetch per channel on startup
 HISTORY_DELAY    = 2     # seconds between channels during history
+MAX_ARTIFACT_MB  = int(os.getenv("TG_MAX_ARTIFACT_MB", "100"))  # skip files bigger than this
 
 # ── Leak detection ─────────────────────────────────────────────────────────────
 EMAIL_RE  = re.compile(r'[\w\.-]+@[\w\.-]+\.\w{2,}')
@@ -217,8 +220,25 @@ def ensure_tables():
         last_message  INTEGER,
         discovered_from TEXT
     );
+    CREATE TABLE IF NOT EXISTS telegram_artifacts (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id      TEXT,
+        channel_name    TEXT,
+        message_id      INTEGER,
+        filename        TEXT,
+        mime_type       TEXT,
+        size_bytes      INTEGER,
+        sha256          TEXT,
+        local_path      TEXT,
+        downloaded_at   INTEGER,
+        download_status TEXT DEFAULT 'downloaded',
+        error           TEXT,
+        UNIQUE(channel_id, message_id, filename)
+    );
     CREATE INDEX IF NOT EXISTS idx_tg_has_leak ON telegram_messages(has_leak);
     CREATE INDEX IF NOT EXISTS idx_tg_channel  ON telegram_messages(channel_id);
+    CREATE INDEX IF NOT EXISTS idx_tg_artifacts_msg ON telegram_artifacts(channel_id, message_id);
+    CREATE INDEX IF NOT EXISTS idx_tg_artifacts_sha ON telegram_artifacts(sha256);
     ''')
 
     # ── Migrations for existing databases ─────────────────────────────────────
@@ -351,6 +371,148 @@ def discover_new_channels(extracted, source):
     for ch_url in extracted.get('discovered_channels', []):
         name = ch_url.split('/')[-1]
         save_channel(ch_url, name, 'discovered', source)
+
+def safe_filename(name):
+    name = name or "telegram_file.bin"
+    name = Path(str(name)).name
+    name = re.sub(r'[^A-Za-z0-9._ -]+', '_', name).strip()
+    return name or "telegram_file.bin"
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def artifact_already_saved(channel_id, message_id, filename):
+    con = db()
+    row = con.execute("""SELECT local_path FROM telegram_artifacts
+        WHERE channel_id=? AND message_id=? AND filename=?""",
+        (str(channel_id), int(message_id), filename)).fetchone()
+    con.close()
+    if not row:
+        return False
+    local_path = row['local_path']
+    return bool(local_path and Path(local_path).exists())
+
+def save_artifact_record(channel_id, channel_name, message_id, filename,
+                         mime_type, size_bytes, sha256, local_path,
+                         status='downloaded', error=None):
+    con = db()
+    try:
+        con.execute("""INSERT OR REPLACE INTO telegram_artifacts
+            (channel_id, channel_name, message_id, filename, mime_type,
+             size_bytes, sha256, local_path, downloaded_at, download_status, error)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(channel_id), channel_name, int(message_id), filename, mime_type,
+             size_bytes, sha256, str(local_path) if local_path else None,
+             int(time.time()), status, error))
+        con.commit()
+    except Exception as e:
+        log.debug(f"Artifact DB save error: {e}")
+    finally:
+        con.close()
+
+async def download_telegram_artifact(client, msg, channel_id, channel_name):
+    """
+    Download Telegram document/file attachments and save metadata.
+    Returns artifact metadata dict or None.
+    """
+    if not getattr(msg, 'file', None):
+        return None
+
+    filename = safe_filename(getattr(msg.file, 'name', None) or f"telegram_{msg.id}.bin")
+    mime_type = getattr(msg.file, 'mime_type', None)
+    size_bytes = getattr(msg.file, 'size', None) or 0
+
+    if size_bytes and size_bytes > MAX_ARTIFACT_MB * 1024 * 1024:
+        save_artifact_record(channel_id, channel_name, msg.id, filename,
+                             mime_type, size_bytes, None, None,
+                             status='skipped_too_large',
+                             error=f"File exceeds TG_MAX_ARTIFACT_MB={MAX_ARTIFACT_MB}")
+        log.info(f"[ARTIFACT SKIPPED] {channel_name}/{msg.id} {filename} ({size_bytes} bytes)")
+        return None
+
+    if artifact_already_saved(channel_id, msg.id, filename):
+        return None
+
+    channel_dir = ARTIFACT_DIR / safe_filename(str(channel_name)) / str(msg.id)
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    dest = channel_dir / filename
+
+    if dest.exists():
+        stem, suffix = dest.stem, dest.suffix
+        n = 2
+        while True:
+            candidate = channel_dir / f"{stem}_{n}{suffix}"
+            if not candidate.exists():
+                dest = candidate
+                filename = dest.name
+                break
+            n += 1
+
+    try:
+        downloaded = await client.download_media(msg, file=str(dest))
+        final_path = Path(downloaded) if downloaded else dest
+        digest = sha256_file(final_path) if final_path.exists() else None
+        final_size = final_path.stat().st_size if final_path.exists() else size_bytes
+
+        save_artifact_record(channel_id, channel_name, msg.id, filename,
+                             mime_type, final_size, digest, final_path)
+        log.info(f"[ARTIFACT DOWNLOADED] {channel_name}/{msg.id} {filename} sha256={digest}")
+        return {
+            'filename': filename,
+            'mime_type': mime_type,
+            'size_bytes': final_size,
+            'sha256': digest,
+            'local_path': str(final_path),
+        }
+    except FloodWaitError as e:
+        log.warning(f"Flood wait {e.seconds}s during artifact download — sleeping")
+        await asyncio.sleep(e.seconds + FLOOD_BUFFER)
+        return None
+    except Exception as e:
+        save_artifact_record(channel_id, channel_name, msg.id, filename,
+                             mime_type, size_bytes, None, dest,
+                             status='error', error=str(e))
+        log.warning(f"Artifact download failed {channel_name}/{msg.id} {filename}: {e}")
+        return None
+
+async def process_telegram_message(client, msg, channel_id, channel_name, source='history'):
+    text = getattr(msg, 'text', None) or getattr(msg, 'message', None) or ''
+    artifact = await download_telegram_artifact(client, msg, channel_id, channel_name)
+
+    if not text and artifact:
+        text = f"[Telegram attachment] {artifact['filename']}"
+
+    if not text:
+        return False, 0, {}
+
+    is_leak, conf, extracted = analyze_message(text)
+    if artifact:
+        extracted['telegram_artifact'] = artifact
+        fn = artifact['filename'].lower()
+        if any(x in fn for x in ('cve-', 'exploit', 'poc', 'shell', 'webshell')):
+            is_leak = True
+            conf = max(conf, 45)
+
+    if getattr(msg, 'date', None):
+        ts = int(msg.date.replace(tzinfo=timezone.utc).timestamp())
+    else:
+        ts = int(time.time())
+
+    save_message(channel_id, channel_name, msg.id, text, ts, is_leak, conf, extracted)
+    discover_new_channels(extracted, channel_name)
+
+    con = db()
+    con.execute("""UPDATE telegram_channels SET
+        message_count=message_count+1, last_message=?
+        WHERE channel_id=?""", (ts, str(channel_id)))
+    con.commit()
+    con.close()
+
+    return is_leak, conf, extracted
 
 # ── Safe entity loading ────────────────────────────────────────────────────────
 async def safe_get_entity(client, ch, delay=True):
@@ -493,18 +655,16 @@ async def run_monitor():
     #    history/join phases which can take hours with 200+ pending channels ──────
     @client.on(events.NewMessage)
     async def handler(event):
-        if not event.text: return
         try:
             chat = await event.get_chat()
             name = getattr(chat, 'title', str(chat.id))
-            is_leak, conf, extracted = analyze_message(event.text)
-            ts = int(time.time())
-            save_message(chat.id, name, event.id,
-                         event.text, ts, is_leak, conf, extracted)
-            discover_new_channels(extracted, name)
+            is_leak, conf, extracted = await process_telegram_message(
+                client, event.message, chat.id, name, source='live')
+
             if is_leak:
                 si    = extracted.get('stealer_intel', {})
                 mi    = extracted.get('message_intel', {})
+                art   = extracted.get('telegram_artifact', {})
                 parts = []
                 if si.get('families'):      parts.append(f"families:{','.join(si['families'])}")
                 if mi.get('c2_ips'):        parts.append(f"C2:{mi['c2_ips'][0]}")
@@ -513,14 +673,9 @@ async def run_monitor():
                 if mi.get('github_links'):  parts.append(f"gh:{mi['github_links'][0]}")
                 if mi.get('attributed_to'): parts.append(f"actor:{mi['attributed_to'][0]}")
                 if mi.get('cred_count'):    parts.append(f"creds:{mi['cred_count']}")
-                detail = ' | '.join(parts) if parts else event.text[:60]
+                if art.get('filename'):     parts.append(f"file:{art['filename']}")
+                detail = ' | '.join(parts) if parts else (event.text or '')[:60]
                 log.info(f"[LIVE LEAK {conf}%] {name} | {detail}")
-            con = db()
-            con.execute('''UPDATE telegram_channels SET
-                message_count=message_count+1, last_message=?
-                WHERE channel_id=?''', (ts, str(chat.id)))
-            con.commit()
-            con.close()
         except Exception as e:
             import traceback
             log.warning(f"Handler error: {e}\n{traceback.format_exc()}")
@@ -569,23 +724,24 @@ async def run_monitor():
             name = getattr(entity, 'title', str(entity.id))
             try:
                 async for msg in client.iter_messages(entity, limit=HISTORY_LIMIT):
-                    if not msg.text: continue
-                    is_leak, conf, extracted = analyze_message(msg.text)
-                    ts = int(msg.date.replace(tzinfo=timezone.utc).timestamp())
-                    save_message(entity.id, name, msg.id,
-                                 msg.text, ts, is_leak, conf, extracted)
+                    is_leak, conf, extracted = await process_telegram_message(
+                        client, msg, entity.id, name, source='history')
+                    if not (getattr(msg, 'text', None) or getattr(msg, 'message', None) or extracted.get('telegram_artifact')):
+                        continue
                     total_msgs += 1
                     if is_leak:
                         total_leaks += 1
                         si = extracted.get('stealer_intel', {})
+                        art = extracted.get('telegram_artifact', {})
                         families = si.get('families', [])
                         if families:
                             stealer_hits += 1
                             log.info(f"[LEAK {conf}% | {', '.join(families)}] "
-                                     f"{name}: {msg.text[:70]}")
+                                     f"{name}: {(getattr(msg, 'text', None) or art.get('filename',''))[:70]}")
+                        elif art.get('filename'):
+                            log.info(f"[LEAK {conf}% | FILE] {name}: {art['filename']}")
                         else:
-                            log.info(f"[LEAK {conf}%] {name}: {msg.text[:80]}")
-                        discover_new_channels(extracted, name)
+                            log.info(f"[LEAK {conf}%] {name}: {(getattr(msg, 'text', None) or '')[:80]}")
 
                 con = db()
                 con.execute(
