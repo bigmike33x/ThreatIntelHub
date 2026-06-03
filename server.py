@@ -202,6 +202,103 @@ def prettify_leak_name(leak_name):
     return f"{label.title()} Breach"
 
 
+
+def _context_get(ctx, names):
+    """Return first non-empty value from a JSON context row using case-insensitive keys."""
+    if not isinstance(ctx, dict):
+        return ""
+    lower_map = {str(k).strip().lower(): v for k, v in ctx.items()}
+    for name in names:
+        v = lower_map.get(str(name).strip().lower())
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def _context_domain(email, fallback=""):
+    email = str(email or "").strip()
+    if "@" in email:
+        return email.split("@", 1)[1].strip().lower()
+    fallback = str(fallback or "").strip().lower()
+    return fallback if "." in fallback else ""
+
+
+def build_exposure_captured_data(value, entity_type, context_json):
+    """Create user-facing captured-data summary from exposure_occurrences.context.
+
+    The worker stores CSV/TSV rows as JSON. This function maps common column
+    names into stable UI fields while keeping the original row available as a
+    preview. Password-like fields are intentionally redacted in the UI response.
+    """
+    ctx = {}
+    raw_context = context_json or ""
+    if raw_context:
+        try:
+            parsed = json.loads(raw_context)
+            if isinstance(parsed, dict):
+                ctx = parsed
+        except Exception:
+            ctx = {}
+
+    value = str(value or "").strip()
+    entity_type = str(entity_type or "").strip().lower()
+
+    first = _context_get(ctx, ["First Name", "first_name", "firstname", "first", "given_name", "given name"])
+    last = _context_get(ctx, ["Last Name", "last_name", "lastname", "last", "surname", "family_name", "family name"])
+    full_name = _context_get(ctx, ["Name", "Full Name", "full_name", "Contact Name", "contact_name", "Person Name"])
+    if not full_name:
+        full_name = f"{first} {last}".strip()
+
+    company = _context_get(ctx, [
+        "Account Name", "Company", "company", "Company Name", "company_name",
+        "Organization", "organization", "Employer", "employer", "Business Name"
+    ])
+
+    email = _context_get(ctx, [
+        "Email", "email", "Email Address", "email_address", "Work Email",
+        "work_email", "Business Email", "business_email"
+    ])
+    if not email and entity_type == "email":
+        email = value
+
+    phone = _context_get(ctx, [
+        "Phone", "phone", "Phone Number", "phone_number", "Direct Phone",
+        "direct_phone", "Mobile", "mobile", "Mobile Phone", "mobile_phone",
+        "ZoomInfo Mobile Phone", "zoominfo_mobile_phone", "Cell", "cell"
+    ])
+
+    domain = _context_get(ctx, ["Domain", "domain", "Website", "website", "Company Domain", "company_domain"])
+    domain = _context_domain(email, domain)
+    if not domain and entity_type == "domain":
+        domain = value.lower()
+
+    title = _context_get(ctx, ["Title", "title", "Job Title", "job_title", "Position", "position"])
+    address = _context_get(ctx, ["Address", "address", "Street", "street", "Mailing Address", "mailing_address"])
+    city = _context_get(ctx, ["City", "city"])
+    state = _context_get(ctx, ["State", "state", "Region", "region"])
+    country = _context_get(ctx, ["Country", "country"])
+
+    password_present = bool(_context_get(ctx, [
+        "Password", "password", "Pass", "pass", "pwd", "Password Hash",
+        "password_hash", "hash", "credential", "credentials"
+    ]))
+
+    captured = {
+        "name": full_name,
+        "title": title,
+        "company": company,
+        "email": email,
+        "phone": phone,
+        "domain": domain,
+        "address": address,
+        "city": city,
+        "state": state,
+        "country": country,
+        "password": "present/redacted" if password_present else "",
+        "context_preview": ctx if ctx else raw_context,
+    }
+    return {k: v for k, v in captured.items() if v not in (None, "", {}, [])}
+
 def trust_score(site):
     """
     Trust score on top of base score:
@@ -1200,12 +1297,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     if archive_source_parts:
                                         source_expr = "COALESCE(NULLIF(eo.leak_name,''), " + ", ".join(archive_source_parts) + ", NULLIF(eo.victim_name,''), 'unknown')"
 
+                            if has_entity_id:
+                                context_select = "MAX(eo.context) AS context_json" if "context" in occ_cols else "NULL AS context_json"
+                                raw_column_select = "MAX(eo.raw_column) AS raw_column" if "raw_column" in occ_cols else "NULL AS raw_column"
+                                row_number_select = "MAX(eo.row_number) AS row_number" if "row_number" in occ_cols else "NULL AS row_number"
+                                source_file_select = "MAX(eo.source_file) AS source_file" if "source_file" in occ_cols else "NULL AS source_file"
+                                archive_file_select = "MAX(eo.archive_file_id) AS archive_file_id" if "archive_file_id" in occ_cols else "NULL AS archive_file_id"
+                            else:
+                                context_select = "NULL AS context_json"
+                                raw_column_select = "NULL AS raw_column"
+                                row_number_select = "NULL AS row_number"
+                                source_file_select = "NULL AS source_file"
+                                archive_file_select = "NULL AS archive_file_id"
+
                             rows = con.execute(f"""
                                 SELECT
                                     ee.{id_col} AS id,
                                     ee.{value_col} AS value,
                                     {f"ee.{type_col}" if type_col else "'unknown'"} AS entity_type,
-                                    GROUP_CONCAT(DISTINCT {source_expr}) AS leak_names
+                                    GROUP_CONCAT(DISTINCT {source_expr}) AS leak_names,
+                                    {context_select},
+                                    {raw_column_select},
+                                    {row_number_select},
+                                    {source_file_select},
+                                    {archive_file_select}
                                 FROM exposure_entities ee
                                 {join_sql}
                                 WHERE {search_where}
@@ -1225,6 +1340,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                     if label not in friendly:
                                         friendly.append(label)
                                 d["leaks"] = friendly or ["Unknown Breach"]
+                                d["captured"] = build_exposure_captured_data(
+                                    d.get("value"),
+                                    d.get("entity_type"),
+                                    d.get("context_json")
+                                )
                                 exposures.append(d)
                                 if len(exposures) >= 100:
                                     break
@@ -1989,6 +2109,71 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con.execute("UPDATE telegram_channels SET active=? WHERE url=?", (0 if mute else 1, url))
             con.commit(); con.close()
             self.send_json({"ok":True,"muted":bool(mute)})
+
+
+        elif p.path == "/api/telegram/channel_clear":
+            channel_id = g("id", "").strip()
+            if not channel_id.isdigit():
+                self.send_json({"ok": False, "reason": "Missing channel id"}, 400)
+                return
+            con = db()
+            try:
+                ch = con.execute("SELECT id, channel_id FROM telegram_channels WHERE id=?", (int(channel_id),)).fetchone()
+                if not ch:
+                    self.send_json({"ok": False, "reason": "Channel not found"}, 404)
+                    return
+                tg_channel_id = ch["channel_id"]
+                con.execute("BEGIN")
+                deleted_messages = 0
+                if tg_channel_id:
+                    if table_exists(con, "msg_tags"):
+                        con.execute("DELETE FROM msg_tags WHERE msg_id IN (SELECT id FROM telegram_messages WHERE channel_id=?)", (tg_channel_id,))
+                    if table_exists(con, "ioc_links"):
+                        con.execute("DELETE FROM ioc_links WHERE msg_id IN (SELECT id FROM telegram_messages WHERE channel_id=?)", (tg_channel_id,))
+                    if table_exists(con, "telegram_artifacts"):
+                        con.execute("DELETE FROM telegram_artifacts WHERE channel_id=?", (tg_channel_id,))
+                    deleted_messages = con.execute("DELETE FROM telegram_messages WHERE channel_id=?", (tg_channel_id,)).rowcount
+                con.execute("UPDATE telegram_channels SET active=0, message_count=0, last_message=NULL WHERE id=?", (int(channel_id),))
+                con.commit()
+                self.send_json({"ok": True, "deleted_messages": deleted_messages})
+            except Exception as e:
+                try: con.rollback()
+                except Exception: pass
+                self.send_json({"ok": False, "reason": str(e)}, 500)
+            finally:
+                con.close()
+
+        elif p.path == "/api/telegram/channel_delete":
+            channel_id = g("id", "").strip()
+            if not channel_id.isdigit():
+                self.send_json({"ok": False, "reason": "Missing channel id"}, 400)
+                return
+            con = db()
+            try:
+                ch = con.execute("SELECT id, channel_id FROM telegram_channels WHERE id=?", (int(channel_id),)).fetchone()
+                if not ch:
+                    self.send_json({"ok": False, "reason": "Channel not found"}, 404)
+                    return
+                tg_channel_id = ch["channel_id"]
+                con.execute("BEGIN")
+                deleted_messages = 0
+                if tg_channel_id:
+                    if table_exists(con, "msg_tags"):
+                        con.execute("DELETE FROM msg_tags WHERE msg_id IN (SELECT id FROM telegram_messages WHERE channel_id=?)", (tg_channel_id,))
+                    if table_exists(con, "ioc_links"):
+                        con.execute("DELETE FROM ioc_links WHERE msg_id IN (SELECT id FROM telegram_messages WHERE channel_id=?)", (tg_channel_id,))
+                    if table_exists(con, "telegram_artifacts"):
+                        con.execute("DELETE FROM telegram_artifacts WHERE channel_id=?", (tg_channel_id,))
+                    deleted_messages = con.execute("DELETE FROM telegram_messages WHERE channel_id=?", (tg_channel_id,)).rowcount
+                con.execute("DELETE FROM telegram_channels WHERE id=?", (int(channel_id),))
+                con.commit()
+                self.send_json({"ok": True, "deleted_messages": deleted_messages})
+            except Exception as e:
+                try: con.rollback()
+                except Exception: pass
+                self.send_json({"ok": False, "reason": str(e)}, 500)
+            finally:
+                con.close()
 
         elif p.path == "/api/telegram/muted":
             con = db()
@@ -4404,10 +4589,44 @@ async function searchPersonal(){
     if(arr.length===1) return `<div style="color:var(--text-3);font-size:11px;margin-bottom:4px;">Leaked From: <span style="color:var(--amber);">${esc(arr[0])}</span></div>`;
     return `<div style="color:var(--text-3);font-size:11px;margin-bottom:4px;">Leaked From:<br>${arr.map(x=>`<span style="color:var(--amber);">• ${esc(x)}</span>`).join('<br>')}</div>`;
   };
-  const exposureRows=(res.exposures||[]).slice(0,25).map(r=>`<div style="margin-top:6px;padding:6px 8px;border-left:2px solid var(--red);">
+  const renderCapturedData=(r)=>{
+    const c = r.captured || {};
+    const hasCaptured = Object.keys(c).some(k => k !== 'context_preview' && c[k]);
+    const fileName = (r.source_file || '').split(/[\/]/).pop();
+    const seenBits = [];
+    if(fileName) seenBits.push(`File: <span style="color:var(--text);">${esc(fileName)}</span>`);
+    if(r.row_number) seenBits.push(`Row: <span style="color:var(--text);">${esc(String(r.row_number))}</span>`);
+    const field = (label, val)=> val ? `<div><span style="color:var(--text-3);">${label}:</span> <span style="color:var(--text);">${esc(String(val))}</span></div>` : '';
+    let preview = '';
+    if(c.context_preview){
+      const raw = typeof c.context_preview === 'string' ? c.context_preview : JSON.stringify(c.context_preview, null, 2);
+      preview = `<details style="margin-top:6px;"><summary style="cursor:pointer;color:var(--accent-hi);font-size:11px;">Context Preview</summary><pre style="margin-top:6px;white-space:pre-wrap;word-break:break-word;background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:6px;padding:8px;max-height:180px;overflow:auto;color:var(--text-2);font-family:JetBrains Mono,monospace;font-size:11px;">${esc(raw.substring(0,4000))}</pre></details>`;
+    }
+    return `<div style="margin-top:8px;padding:8px 10px;background:rgba(255,255,255,.025);border:1px solid var(--border);border-radius:7px;">
+      <div style="font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Seen In</div>
+      <div style="font-size:12px;color:var(--text-2);margin-bottom:8px;">${seenBits.length ? seenBits.join(' · ') : 'File/row not stored'}</div>
+      ${hasCaptured ? `<div style="font-size:11px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px;">Captured Data</div>
+        <div style="font-size:12px;line-height:1.65;">
+          ${field('Name', c.name)}
+          ${field('Title', c.title)}
+          ${field('Company', c.company)}
+          ${field('Email', c.email)}
+          ${field('Phone', c.phone)}
+          ${field('Domain', c.domain)}
+          ${field('Address', c.address)}
+          ${field('City', c.city)}
+          ${field('State', c.state)}
+          ${field('Country', c.country)}
+          ${field('Password', c.password)}
+        </div>` : `<div style="font-size:12px;color:var(--text-3);">No structured captured fields stored for this row yet.</div>`}
+      ${preview}
+    </div>`;
+  };
+  const exposureRows=(res.exposures||[]).slice(0,25).map(r=>`<div style="margin-top:6px;padding:8px 10px;border-left:2px solid var(--red);background:rgba(239,68,68,.025);">
       ${formatLeaks(r.leaks)}
-      <span style="color:var(--text)">${esc(r.value||'')}</span>
-      <span class="chip chip-red">${esc(r.entity_type||'entity')}</span>
+      <div><span style="color:var(--text);font-family:JetBrains Mono,monospace;">${esc(r.value||'')}</span>
+      <span class="chip chip-red">${esc(r.entity_type||'entity')}</span></div>
+      ${renderCapturedData(r)}
     </div>`).join('');
   const leakRows=(res.leaks||[]).slice(0,10).map(r=>`<div style="margin-top:4px;padding:4px 8px;border-left:2px solid var(--amber);">
       <span style="color:var(--text)">${esc(r.title||'')}</span>
@@ -5356,19 +5575,55 @@ function setTgTab(v){
 
 async function muteChannel(url, btn){
   if(!url){ toast("No URL for channel","error"); return; }
-  const isMuted = btn.textContent.trim() === "🔊";  // 🔊 = currently muted, click to unmute
-  const mute = isMuted ? 0 : 1;  // clicking unmute icon sends mute=0, clicking mute icon sends mute=1
+  const label = btn.textContent.trim();
+  const isMuted = label === "🔊" || label === "Enable";  // currently disabled/muted, click to enable
+  const mute = isMuted ? 0 : 1;
   try {
     const res = await fetch("/api/telegram/mute?url="+encodeURIComponent(url)+"&mute="+mute)
       .then(r=>r.json());
     if(res&&res.ok){
-      btn.textContent = mute ? "🔊" : "🔇";
+      if(label === "Enable" || label === "Disable"){
+        btn.textContent = mute ? "Enable" : "Disable";
+      } else {
+        btn.textContent = mute ? "🔊" : "🔇";
+      }
       btn.style.borderColor = mute ? "var(--red)" : "";
       btn.style.color = mute ? "var(--red)" : "";
-      btn.title = mute ? "Unmute channel" : "Mute channel";
-      toast(mute ? "Channel muted" : "Channel unmuted", "info");
+      btn.title = mute ? "Enable channel" : "Disable channel";
+      toast(mute ? "Channel disabled" : "Channel enabled", "info");
     }
   } catch(e){ toast("Mute failed","error"); }
+}
+
+
+async function clearTelegramChannel(id, name){
+  if(!id){ toast('Missing channel id','error'); return; }
+  const label = name || 'this channel';
+  if(!confirm(`Clear all stored messages, IOCs, tags, and artifact DB rows for "${label}"? The channel will also be disabled.`)) return;
+  const res = await fetch('/api/telegram/channel_clear?id=' + encodeURIComponent(id))
+    .then(r=>r.json()).catch(e=>({ok:false, reason:String(e)}));
+  if(res && res.ok){
+    toast(`Channel cleared (${(res.deleted_messages||0).toLocaleString()} messages)`, 'success');
+    loadTelegramStats();
+    loadTelegram();
+  } else {
+    toast((res && res.reason) || 'Clear failed', 'error', 5000);
+  }
+}
+
+async function deleteTelegramChannel(id, name){
+  if(!id){ toast('Missing channel id','error'); return; }
+  const label = name || 'this channel';
+  if(!confirm(`Delete "${label}" and clear all stored Telegram data for it?`)) return;
+  const res = await fetch('/api/telegram/channel_delete?id=' + encodeURIComponent(id))
+    .then(r=>r.json()).catch(e=>({ok:false, reason:String(e)}));
+  if(res && res.ok){
+    toast(`Channel deleted (${(res.deleted_messages||0).toLocaleString()} messages)`, 'success');
+    loadTelegramStats();
+    loadTelegram();
+  } else {
+    toast((res && res.reason) || 'Delete failed', 'error', 5000);
+  }
 }
 
 function toggleTgMsg(id){
@@ -5539,9 +5794,13 @@ async function loadTelegram(){
       <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:${c.joined?'var(--accent)':'var(--dim)'};">${c.joined?'joined':'pending'}</td>
       <td>${sourceTierSelect(c)}</td>
       <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:var(--accent2);">${(c.message_count||0).toLocaleString()}</td>
-      <td><button class="icon-btn" data-url="${esc(c.url||'')}" onclick="event.stopPropagation();muteChannel(this.getAttribute('data-url'),this)" title="Mute/Unmute channel" style="${!c.active?'border-color:var(--red);color:var(--red);':''}">${c.active?'&#128263;':'&#128266;'}</button></td>
+      <td style="white-space:nowrap;display:flex;gap:5px;align-items:center;">
+        <button class="row-btn" data-url="${esc(c.url||'')}" onclick="event.stopPropagation();muteChannel(this.getAttribute('data-url'),this); setTimeout(loadTelegram,250);" title="Disable/Enable channel" style="${!c.active?'border-color:var(--red);color:var(--red);':''}">${c.active?'Disable':'Enable'}</button>
+        <button class="row-btn" onclick="event.stopPropagation();clearTelegramChannel(${Number(c.id)||0}, '${jsEsc(c.name||c.url||'channel')}')" title="Clear stored channel data">Clear Data</button>
+        <button class="row-btn" onclick="event.stopPropagation();deleteTelegramChannel(${Number(c.id)||0}, '${jsEsc(c.name||c.url||'channel')}')" title="Delete channel" style="border-color:var(--red);color:var(--red);">Delete</button>
+      </td>
     </tr>`).join('');
-    wrap.innerHTML=`<table><thead><tr><th>URL</th><th>Name</th><th>Type</th><th>Status</th><th>Source Tier</th><th>Messages</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+    wrap.innerHTML=`<table><thead><tr><th>URL</th><th>Name</th><th>Type</th><th>Status</th><th>Source Tier</th><th>Messages</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table>`;
     pgEl.innerHTML='';
     return;
   }
