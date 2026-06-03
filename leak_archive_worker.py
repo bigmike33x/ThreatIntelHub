@@ -8,6 +8,9 @@ download -> ClamAV scan archive -> extract -> ClamAV scan extracted folder
 -> inventory/score files -> import useful text-like files into crawler.db
 """
 
+import logging
+import csv
+import json
 import argparse
 import hashlib
 import mimetypes
@@ -25,21 +28,90 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+logging.getLogger("PyPDF2").setLevel(logging.ERROR)
+
+
+# --- nested archive support patch ---
+NESTED_ARCHIVE_EXTS = {".zip", ".7z", ".rar", ".tar", ".gz", ".tgz"}
+
+def is_macos_resource_fork(path):
+    import os
+    parts = path.replace("\\", "/").split("/")
+    base = os.path.basename(path)
+    return "__MACOSX" in parts or base.startswith("._") or base == ".DS_Store"
+
+def expand_nested_archives(root_dir, max_depth=3):
+    import os, zipfile, subprocess, shutil
+    from pathlib import Path
+
+    root = Path(root_dir)
+    expanded = 0
+
+    for depth in range(max_depth):
+        found = False
+
+        for f in list(root.rglob("*")):
+            if not f.is_file():
+                continue
+
+            if is_macos_resource_fork(str(f)):
+                continue
+
+            ext = f.suffix.lower()
+            if ext not in NESTED_ARCHIVE_EXTS:
+                continue
+
+            out_dir = f.with_suffix("")
+            out_dir = f.parent / (out_dir.name + "__nested_extract")
+
+            if out_dir.exists():
+                continue
+
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                if ext == ".zip":
+                    with zipfile.ZipFile(f, "r") as z:
+                        z.extractall(out_dir)
+                else:
+                    shutil.which("7z") or (_ for _ in ()).throw(RuntimeError("7z not installed"))
+                    subprocess.run(["7z", "x", "-y", f"-o{out_dir}", str(f)], check=True)
+
+                found = True
+                expanded += 1
+                print(f"[nested-archive] extracted {f} -> {out_dir}")
+
+            except Exception as e:
+                print(f"[nested-archive] failed {f}: {e}")
+
+        if not found:
+            break
+
+    return expanded
+# --- end nested archive support patch ---
+
+
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "crawler.db"
 BASE_TMP = Path("/tmp/leak_processing")
 
 ALLOWED_EXTS = {
-    ".csv", ".tsv", ".txt", ".json", ".ndjson", ".sql", ".log", ".xml"
+    ".csv", ".tsv", ".txt", ".json", ".ndjson", ".sql", ".log", ".xml",
+    ".pdf", ".pptx"
+}
+
+DOCUMENT_EXTRACT_EXTS = {
+    ".pdf", ".pptx"
 }
 
 SKIP_EXTS = {
     ".exe", ".dll", ".so", ".bin", ".dat", ".jpg", ".jpeg", ".png",
-    ".gif", ".mp4", ".mp3", ".pdf", ".iso", ".img", ".bat", ".ps1",
+    ".gif", ".mp4", ".mp3", ".iso", ".img", ".bat", ".ps1",
     ".vbs", ".js", ".jar", ".scr", ".msi", ".com"
 }
 
-MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = None
 MAX_SAMPLE_BYTES = 1024 * 1024
 MAX_FULL_FILE_BYTES = 500 * 1024 * 1024
 MAX_EXTRACTED_FILES = 50000
@@ -160,9 +232,27 @@ def init_tables(con):
         ("entity_type", "TEXT"),
         ("source_file", "TEXT"),
         ("archive_id", "INTEGER"),
+        ("archive_file_id", "INTEGER"),
+        ("row_number", "INTEGER"),
+        ("context", "TEXT"),
+        ("raw_column", "TEXT"),
         ("created_at", "TEXT"),
     ]:
         add_column_if_missing(con, "exposure_occurrences", col, definition)
+
+    for col, definition in [
+        ("rows_seen", "INTEGER DEFAULT 0"),
+        ("error", "TEXT"),
+        ("inner_path", "TEXT"),
+        ("inner_filename", "TEXT"),
+        ("parent_folder", "TEXT"),
+        ("extension", "TEXT"),
+        ("compressed_size", "INTEGER DEFAULT 0"),
+        ("uncompressed_size", "INTEGER DEFAULT 0"),
+        ("processable", "INTEGER DEFAULT 0"),
+        ("processed", "INTEGER DEFAULT 0"),
+    ]:
+        add_column_if_missing(con, "leak_archive_files", col, definition)
 
     con.commit()
 
@@ -200,7 +290,7 @@ def download_file(url, dest):
             if not chunk:
                 break
             total += len(chunk)
-            if total > MAX_DOWNLOAD_BYTES:
+            if MAX_DOWNLOAD_BYTES is not None and total > MAX_DOWNLOAD_BYTES:
                 raise RuntimeError("Download exceeded MAX_DOWNLOAD_BYTES")
             f.write(chunk)
 
@@ -315,6 +405,52 @@ def is_binary(path):
         return True
 
 
+def extract_pdf_text(path):
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        raise RuntimeError("PDF file detected, but pypdf is not installed. Install with: pip install pypdf")
+
+    text = []
+    reader = PdfReader(str(path))
+
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text.append(page_text)
+
+    return "\n".join(text)
+
+
+def extract_pptx_text(path):
+    try:
+        from pptx import Presentation
+    except ImportError:
+        raise RuntimeError("PPTX file detected, but python-pptx is not installed. Install with: pip install python-pptx")
+
+    text = []
+    prs = Presentation(str(path))
+
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text:
+                text.append(shape.text)
+
+    return "\n".join(text)
+
+
+def extract_document_text(path):
+    ext = path.suffix.lower()
+
+    if ext == ".pdf":
+        return extract_pdf_text(path)
+
+    if ext == ".pptx":
+        return extract_pptx_text(path)
+
+    raise RuntimeError(f"Unsupported document extraction type: {ext}")
+
+
 def score_file(path):
     ext = path.suffix.lower()
     size = path.stat().st_size
@@ -346,15 +482,33 @@ def score_file(path):
         score -= 20
         reasons.append("low_value_filename")
 
-    if is_binary(path):
-        score -= 100
-        reasons.append("binary_file")
-        return score, "binary", ",".join(reasons)
+    if ext in DOCUMENT_EXTRACT_EXTS:
+        score += 50
+        reasons.append("extractable_document")
 
-    try:
-        sample = path.read_bytes()[:MAX_SAMPLE_BYTES].decode("utf-8", errors="ignore")
-    except Exception:
-        return -100, "unreadable", "decode_error"
+        detected = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+
+        try:
+            sample = extract_document_text(path)[:MAX_SAMPLE_BYTES]
+        except Exception as e:
+            score -= 80
+            reasons.append(f"document_extract_error:{e}")
+            return score, detected, ",".join(reasons)
+
+        if not sample.strip():
+            score -= 30
+            reasons.append("no_extractable_text")
+
+    else:
+        if is_binary(path):
+            score -= 100
+            reasons.append("binary_file")
+            return score, "binary", ",".join(reasons)
+
+        try:
+            sample = path.read_bytes()[:MAX_SAMPLE_BYTES].decode("utf-8", errors="ignore")
+        except Exception:
+            return -100, "unreadable", "decode_error"
 
     if EMAIL_RE.search(sample):
         score += 25
@@ -383,6 +537,8 @@ def inventory_files(con, archive_id, extract_dir):
     count = 0
     for path in extract_dir.rglob("*"):
         if not path.is_file():
+            continue
+        if is_macos_resource_fork(str(path)):
             continue
         count += 1
         if count > MAX_EXTRACTED_FILES:
@@ -432,11 +588,17 @@ def upsert_entity(con, value, entity_type):
     return cur.lastrowid
 
 
-def insert_occurrence(con, archive, entity_id, value, entity_type, source_file):
+def insert_occurrence(con, archive, entity_id, value, entity_type, source_file, archive_file_id=None, row_number=None, context=None, raw_column=None):
+    if context is not None:
+        context = str(context)
+        if len(context) > 20000:
+            context = context[:20000] + " ...[truncated]"
+
     con.execute("""
         INSERT INTO exposure_occurrences
-        (victim_name, actor, leak_name, entity_id, value_plain, entity_type, source_file, archive_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        (victim_name, actor, leak_name, entity_id, value_plain, entity_type,
+         source_file, archive_id, archive_file_id, row_number, context, raw_column, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
     """, (
         archive["victim_name"],
         archive["actor"],
@@ -446,6 +608,10 @@ def insert_occurrence(con, archive, entity_id, value, entity_type, source_file):
         entity_type,
         source_file,
         archive["id"],
+        archive_file_id,
+        row_number,
+        context,
+        raw_column,
     ))
 
 
@@ -472,21 +638,69 @@ def process_file(con, archive, file_row):
     imported = 0
 
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
+        if path.suffix.lower() in {".csv", ".tsv"}:
+            delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+            with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                reader = csv.DictReader(f, delimiter=delimiter)
+                for row_number, row in enumerate(reader, start=2):
+                    clean_row = {str(k): ("" if v is None else str(v)) for k, v in row.items() if k is not None}
+                    context = json.dumps(clean_row, ensure_ascii=False)
+
+                    for col_name, cell in clean_row.items():
+                        if not cell:
+                            continue
+
+                        for value, entity_type in extract_entities_from_text(cell):
+                            entity_id = upsert_entity(con, value, entity_type)
+                            insert_occurrence(
+                                con,
+                                archive,
+                                entity_id,
+                                value,
+                                entity_type,
+                                str(path),
+                                archive_file_id=file_row["id"],
+                                row_number=row_number,
+                                context=context,
+                                raw_column=col_name,
+                            )
+                            imported += 1
+
+                    if imported and imported % 5000 == 0:
+                        con.commit()
+        else:
+            if path.suffix.lower() in DOCUMENT_EXTRACT_EXTS:
+                lines = extract_document_text(path).splitlines()
+            else:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+
+            for row_number, line in enumerate(lines, start=1):
+                context = line.strip()
                 for value, entity_type in extract_entities_from_text(line):
                     entity_id = upsert_entity(con, value, entity_type)
-                    insert_occurrence(con, archive, entity_id, value, entity_type, str(path))
+                    insert_occurrence(
+                        con,
+                        archive,
+                        entity_id,
+                        value,
+                        entity_type,
+                        str(path),
+                        archive_file_id=file_row["id"],
+                        row_number=row_number,
+                        context=context,
+                        raw_column=value,
+                    )
                     imported += 1
 
-                if imported and imported % 5000 == 0:
-                    con.commit()
+            if imported and imported % 5000 == 0:
+                con.commit()
 
         con.execute("""
             UPDATE leak_archive_files
-            SET status='processed', reason=?
+            SET status='processed', reason=?, rows_seen=COALESCE(rows_seen,0)+?
             WHERE id=?
-        """, (f"imported={imported}", file_row["id"]))
+        """, (f"imported={imported}", imported, file_row["id"]))
         con.commit()
         return imported
 
@@ -521,7 +735,26 @@ def process_archive(archive_id):
         filename = f"download_{archive_id}{ext if ext else ''}"
         archive_path = download_dir / filename
 
-        download_file(archive["download_url"], archive_path)
+        if (archive["download_url"] or "").startswith("local://"):
+            local_name = archive["download_url"].replace("local://", "", 1)
+            candidates = []
+            if "local_path" in archive.keys() and archive["local_path"]:
+                candidates.append(Path(archive["local_path"]))
+            candidates.extend([
+                BASE_DIR / "stealer_uploads" / local_name,
+                BASE_DIR / "manual_uploads" / local_name,
+                BASE_DIR / local_name,
+            ])
+            local_src = next((c for c in candidates if c.exists()), None)
+
+            if not local_src:
+                tried = ", ".join(str(c) for c in candidates)
+                raise RuntimeError(f"Local upload file not found. Tried: {tried}")
+
+            shutil.copy2(local_src, archive_path)
+        else:
+            download_file(resolve_download_url(archive["download_url"]), archive_path)
+
         update_archive(con, archive_id, local_path=str(archive_path), sha256=sha256_file(archive_path))
 
         update_archive(con, archive_id, status="scanning_archive")
@@ -550,6 +783,7 @@ def process_archive(archive_id):
 
         update_archive(con, archive_id, status="extracting")
         extract_archive(archive_path, extract_dir)
+        expand_nested_archives(extract_dir)
 
         update_archive(con, archive_id, status="scanning_extracted")
         scan2 = clam_scan(extract_dir)
@@ -576,6 +810,10 @@ def process_archive(archive_id):
             return
 
         update_archive(con, archive_id, status="inventory")
+        # A rerun creates a new /tmp/leak_processing/archive_<id>_<timestamp> path.
+        # Remove old file inventory rows so the importer does not try deleted temp paths.
+        con.execute("DELETE FROM leak_archive_files WHERE archive_id=?", (archive_id,))
+        con.commit()
         files_found = inventory_files(con, archive_id, extract_dir)
         update_archive(con, archive_id, files_found=files_found)
 
@@ -612,18 +850,6 @@ def process_archive(archive_id):
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
         con.close()
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--job-id", type=int, required=True)
-    args = parser.parse_args()
-    process_archive(args.job_id)
-
-
-if __name__ == "__main__":
-    main()
-
 
 def resolve_anonfilesnew(url):
     headers = {
@@ -678,3 +904,13 @@ def resolve_download_url(url):
     if resolver:
         return resolver(url)
     return url
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--job-id", type=int, required=True)
+    args = parser.parse_args()
+    process_archive(args.job_id)
+
+
+if __name__ == "__main__":
+    main()
