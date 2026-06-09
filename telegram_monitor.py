@@ -70,7 +70,13 @@ BASE_DIR   = Path(__file__).parent
 DB_PATH    = BASE_DIR / "crawler.db"
 SEEDS_FILE = BASE_DIR / "cti_seeds.json"
 SESSION    = str(BASE_DIR / "tg_monitor_session")
-ARTIFACT_DIR = Path(os.getenv("TG_ARTIFACT_DIR", str(BASE_DIR / "telegram_artifacts")))
+
+# Telegram artifacts are written to TG_ARTIFACT_DIR when set.
+# In production, point this at the mounted drive, for example:
+#   export TG_ARTIFACT_DIR=/mnt/intel_storage/telegram_artifacts
+# If unset, this falls back to ./telegram_artifacts, which can be a real
+# directory or a symlink to external storage. This keeps the repo portable.
+ARTIFACT_DIR = Path(os.getenv("TG_ARTIFACT_DIR", str(BASE_DIR / "telegram_artifacts"))).expanduser()
 
 # ── Rate limit settings ────────────────────────────────────────────────────────
 JOIN_DELAY       = 15    # seconds between each join attempt
@@ -80,6 +86,49 @@ FLOOD_BUFFER     = 30    # extra seconds added to any flood wait
 HISTORY_LIMIT    = 50    # messages to fetch per channel on startup
 HISTORY_DELAY    = 2     # seconds between channels during history
 MAX_ARTIFACT_MB  = int(os.getenv("TG_MAX_ARTIFACT_MB", "100"))  # skip files bigger than this
+
+
+# ── Telegram artifact filtering ────────────────────────────────────────────────
+ALLOWED_TG_ARTIFACT_EXTS = {
+    ".txt", ".csv", ".json", ".sql", ".log", ".conf", ".xml", ".yaml", ".yml",
+    ".zip", ".7z", ".rar", ".tar", ".gz",
+    ".py", ".php", ".js", ".ps1", ".sh", ".bat",
+    ".exe", ".dll", ".apk"
+}
+
+SKIP_TG_MIME_PREFIXES = ("image/", "video/", "audio/")
+SKIP_TG_MIME_TYPES = {
+    "application/x-tgsticker",
+    "application/x-bad-tgsticker",
+    "application/octet-stream",
+}
+
+def should_download_telegram_artifact(filename, mime_type="", size_bytes=0):
+    filename = str(filename or "").strip()
+    mime_type = str(mime_type or "").lower().strip()
+
+    if not filename:
+        return False
+
+    low = filename.lower()
+    ext = Path(low).suffix
+
+    # Skip generated unknown Telegram blobs like telegram_74761.bin
+    if re.match(r"^telegram_\d+\.bin$", low):
+        return False
+
+    # Skip all plain .bin files for now
+    if ext == ".bin":
+        return False
+
+    # Skip stickers/images/videos/audio
+    if any(mime_type.startswith(p) for p in SKIP_TG_MIME_PREFIXES):
+        return False
+
+    if mime_type in SKIP_TG_MIME_TYPES and ext not in ALLOWED_TG_ARTIFACT_EXTS:
+        return False
+
+    return ext in ALLOWED_TG_ARTIFACT_EXTS
 
 # ── Leak detection ─────────────────────────────────────────────────────────────
 EMAIL_RE  = re.compile(r'[\w\.-]+@[\w\.-]+\.\w{2,}')
@@ -257,6 +306,15 @@ def ensure_tables():
     if 'access_hash' not in chan_cols:
         con.execute("ALTER TABLE telegram_channels ADD COLUMN access_hash TEXT")
         log.info("Migrated: added access_hash column")
+    if 'source_tier' not in chan_cols:
+        con.execute("ALTER TABLE telegram_channels ADD COLUMN source_tier TEXT DEFAULT 'unknown'")
+        log.info("Migrated: added source_tier column")
+    if 'blocked' not in chan_cols:
+        con.execute("ALTER TABLE telegram_channels ADD COLUMN blocked INTEGER DEFAULT 0")
+        log.info("Migrated: added blocked column")
+    if 'blocked_at' not in chan_cols:
+        con.execute("ALTER TABLE telegram_channels ADD COLUMN blocked_at INTEGER")
+        log.info("Migrated: added blocked_at column")
 
     con.commit()
     con.close()
@@ -327,21 +385,39 @@ def save_message(channel_id, channel_name, msg_id, text, timestamp, is_leak, con
 def save_channel(url, name, channel_type, discovered_from=None):
     con = db()
     try:
+        # Never reactivate or duplicate a channel that was blocked from the UI.
+        blocked = con.execute("""
+            SELECT 1
+            FROM telegram_channels
+            WHERE COALESCE(blocked,0)=1
+              AND (url=? OR name=?)
+            LIMIT 1
+        """, (url, name)).fetchone()
+        if blocked:
+            return
+
         con.execute('''INSERT OR IGNORE INTO telegram_channels
             (url,name,channel_type,joined,active,discovered_from)
             VALUES (?,?,?,0,1,?)''',
             (url, name, channel_type, discovered_from or 'seed'))
         con.commit()
-    except: pass
-    con.close()
+    except Exception as e:
+        log.debug(f"Channel save error: {e}")
+    finally:
+        con.close()
 
 def mark_joined(url, channel_id, access_hash=None):
     con = db()
-    con.execute(
-        "UPDATE telegram_channels SET joined=1, channel_id=?, access_hash=? WHERE url=?",
-        (str(channel_id), str(access_hash) if access_hash else None, url))
-    con.commit()
-    con.close()
+    try:
+        # Do not mark UI-blocked channels as joined again.
+        con.execute(
+            """UPDATE telegram_channels
+               SET joined=1, channel_id=?, access_hash=?
+               WHERE url=? AND COALESCE(blocked,0)=0""",
+            (str(channel_id), str(access_hash) if access_hash else None, url))
+        con.commit()
+    finally:
+        con.close()
 
 def mark_inactive(url):
     con = db()
@@ -349,11 +425,35 @@ def mark_inactive(url):
     con.commit()
     con.close()
 
+
+def is_blocked_channel(channel_id):
+    """
+    Returns True if a channel_id is blocked in telegram_channels.
+    """
+    if not channel_id:
+        return False
+
+    con = db()
+    try:
+        row = con.execute("""
+            SELECT 1
+            FROM telegram_channels
+            WHERE channel_id=?
+              AND COALESCE(blocked,0)=1
+            LIMIT 1
+        """, (str(channel_id),)).fetchone()
+        return row is not None
+    except Exception:
+        return False
+    finally:
+        con.close()
+
+
 def get_pending_channels():
     con = db()
     rows = con.execute(
         "SELECT url, name, channel_id, access_hash FROM telegram_channels "
-        "WHERE active=1 AND joined=0 ORDER BY id"
+        "WHERE active=1 AND joined=0 AND COALESCE(blocked,0)=0 ORDER BY id"
     ).fetchall()
     con.close()
     return [dict(r) for r in rows]
@@ -362,7 +462,7 @@ def get_joined_channels():
     con = db()
     rows = con.execute(
         "SELECT url, name, channel_id, access_hash FROM telegram_channels "
-        "WHERE joined=1 AND active=1 ORDER BY id"
+        "WHERE joined=1 AND active=1 AND COALESCE(blocked,0)=0 ORDER BY id"
     ).fetchall()
     con.close()
     return [dict(r) for r in rows]
@@ -371,54 +471,6 @@ def discover_new_channels(extracted, source):
     for ch_url in extracted.get('discovered_channels', []):
         name = ch_url.split('/')[-1]
         save_channel(ch_url, name, 'discovered', source)
-
-# ── Telegram artifact filtering ────────────────────────────────────────────────
-ALLOWED_TG_ARTIFACT_EXTS = {
-    ".txt", ".csv", ".json", ".sql", ".log",
-    ".conf", ".xml", ".yaml", ".yml",
-    ".zip", ".7z", ".rar", ".tar", ".gz",
-    ".py", ".php", ".js", ".ps1", ".sh", ".bat",
-    ".exe", ".dll", ".apk"
-}
-
-SKIP_TG_MIME_PREFIXES = (
-    "image/",
-    "video/",
-    "audio/",
-)
-
-SKIP_TG_MIME_TYPES = {
-    "application/x-tgsticker",
-    "application/x-bad-tgsticker",
-}
-
-def should_download_telegram_artifact(filename, mime_type="", size_bytes=0):
-    filename = str(filename or "").strip()
-    mime_type = str(mime_type or "").lower().strip()
-
-    if not filename:
-        return False
-
-    low = filename.lower()
-    ext = Path(low).suffix
-
-    # Skip generic Telegram mystery blobs like telegram_386239.bin.
-    if re.match(r"^telegram_\d+\.bin$", low):
-        return False
-
-    # Skip all .bin files. These are usually unnamed Telegram media/blob noise.
-    if ext == ".bin":
-        return False
-
-    # Skip visible media/stickers that Telegram exposes as files.
-    if any(mime_type.startswith(prefix) for prefix in SKIP_TG_MIME_PREFIXES):
-        return False
-
-    if mime_type in SKIP_TG_MIME_TYPES:
-        return False
-
-    # Only keep useful intel/archive/script file types.
-    return ext in ALLOWED_TG_ARTIFACT_EXTS
 
 def safe_filename(name):
     name = name or "telegram_file.bin"
@@ -473,14 +525,10 @@ async def download_telegram_artifact(client, msg, channel_id, channel_name):
     filename = safe_filename(getattr(msg.file, 'name', None) or f"telegram_{msg.id}.bin")
     mime_type = getattr(msg.file, 'mime_type', None)
     size_bytes = getattr(msg.file, 'size', None) or 0
-    # Skip useless Telegram media, stickers, thumbnails, and mystery blobs.
-    if not should_download_telegram_artifact(filename, mime_type, size_bytes):
-        log.info(
-            f"[ARTIFACT SKIPPED] {channel_name}/{msg.id} "
-            f"{filename} mime={mime_type} size={size_bytes}"
-        )
-        return None
 
+    if not should_download_telegram_artifact(filename, mime_type, size_bytes):
+        log.info(f"[ARTIFACT SKIPPED] {channel_name}/{msg.id} {filename} mime={mime_type} size={size_bytes}")
+        return None
 
     if size_bytes and size_bytes > MAX_ARTIFACT_MB * 1024 * 1024:
         save_artifact_record(channel_id, channel_name, msg.id, filename,
@@ -536,6 +584,11 @@ async def download_telegram_artifact(client, msg, channel_id, channel_name):
         return None
 
 async def process_telegram_message(client, msg, channel_id, channel_name, source='history'):
+
+    # Ignore blocked channels completely
+    if is_blocked_channel(channel_id):
+        return False, 0, {}
+
     text = getattr(msg, 'text', None) or getattr(msg, 'message', None) or ''
     artifact = await download_telegram_artifact(client, msg, channel_id, channel_name)
 
@@ -859,6 +912,7 @@ if __name__ == '__main__':
     log.info("--------------------------------")
     log.info(f"DB:    {DB_PATH}")
     log.info(f"Seeds: {SEEDS_FILE}")
+    log.info(f"Artifacts: {ARTIFACT_DIR}")
     log.info(f"Join delay: {JOIN_DELAY}s per channel")
     log.info(f"Batch pause: {JOIN_BATCH_PAUSE}s every {JOIN_BATCH_SIZE} joins")
     asyncio.run(run_monitor())

@@ -16,6 +16,12 @@ _STATE_FILE= BASE_DIR / ".crawler_state.json"
 PORT       = 8765
 RANSOMWARE_LIVE_API_KEY = os.environ.get("RANSOMWARE_LIVE_API_KEY", "")
 
+# Server-side cache for ransomware.live /groups — refreshes every 30 minutes.
+# Stale cache is served if the upstream call fails.
+_rw_groups_cache     = None   # parsed response
+_rw_groups_cache_ts  = 0      # unix timestamp of last successful fetch
+_RW_GROUPS_CACHE_TTL = 1800   # 30 minutes
+
 # ── Language detection ─────────────────────────────────────────────────────────
 try:
     from langdetect import detect as _lang_detect
@@ -29,6 +35,21 @@ except ImportError:
 FLAG_EXTS = {'.sql','.gz','.zip','.tar','.7z','.rar',
              '.txt','.csv','.json','.db','.sqlite',
              '.pdf','.docx','.xlsx','.torrent'}
+
+TEXT_CREDENTIAL_ARTIFACT_EXTS = {'.txt', '.csv', '.log', '.sql', '.lst', '.tsv'}
+MAX_TG_CREDENTIAL_INDEX_BYTES = 100 * 1024 * 1024
+MAX_TG_CREDENTIAL_INDEX_LINES = 200_000
+EMAIL_PASS_RE = re.compile(
+    r'^\s*([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})\s*[:;|,]\s*(\S.{0,300})\s*$',
+    re.I
+)
+CONSUMER_EMAIL_DOMAINS = {
+    'gmail.com','googlemail.com','yahoo.com','ymail.com','rocketmail.com',
+    'hotmail.com','hotmail.co.uk','hotmail.fr','hotmail.es','outlook.com',
+    'outlook.co.uk','outlook.fr','outlook.es','live.com','live.co.uk',
+    'live.fr','msn.com','icloud.com','me.com','mac.com','aol.com',
+    'proton.me','protonmail.com','mail.com','gmx.com','gmx.net'
+}
 
 # ── Categorization ─────────────────────────────────────────────────────────────
 CATEGORY_RULES = [
@@ -199,7 +220,18 @@ def prettify_leak_name(leak_name):
     if label == "att":
         return "AT&T Breach"
 
-    return f"{label.title()} Breach"
+    BRAND_CASING = {
+        "rockyou": "RockYou", "linkedin": "LinkedIn", "lastpass": "LastPass",
+        "github": "GitHub", "gitlab": "GitLab", "paypal": "PayPal",
+        "myspace": "MySpace", "dropbox": "Dropbox", "adobe": "Adobe",
+        "ebay": "eBay", "yahoo": "Yahoo", "twitter": "Twitter",
+        "facebook": "Facebook", "uber": "Uber", "doordash": "DoorDash",
+        "canva": "Canva", "twitch": "Twitch", "neopets": "Neopets",
+        "gravatar": "Gravatar", "mathway": "Mathway",
+    }
+    words = label.title().split()
+    corrected = [BRAND_CASING.get(w.lower(), w) for w in words]
+    return f"{' '.join(corrected)} Breach"
 
 
 
@@ -372,19 +404,32 @@ def normalize_telegram_url(url):
     return raw
 
 
-def clear_telegram_channel_data(con, channel_id):
-    """Delete DB data tied to one Telegram channel without touching unrelated tables."""
+def clear_telegram_channel_data(con, channel_id=None, channel_name=None):
+    """Delete DB data tied to one Telegram channel without touching unrelated tables.
+
+    Prefer channel_id, but accept channel_name as a fallback for older/orphaned
+    message rows that were never cleanly represented in telegram_channels.
+    """
     channel_id = str(channel_id or "").strip()
-    if not channel_id:
+    channel_name = str(channel_name or "").strip()
+    if not channel_id and not channel_name:
         return {"messages_removed": 0, "artifacts_removed": 0, "tags_removed": 0, "ioc_links_removed": 0}
 
     removed = {"messages_removed": 0, "artifacts_removed": 0, "tags_removed": 0, "ioc_links_removed": 0}
     msg_ids = []
 
-    if table_exists(con, "telegram_messages"):
+    msg_where, msg_params = [], []
+    if channel_id:
+        msg_where.append("channel_id=?")
+        msg_params.append(channel_id)
+    if channel_name and table_exists(con, "telegram_messages") and column_exists(con, "telegram_messages", "channel_name"):
+        msg_where.append("channel_name=?")
+        msg_params.append(channel_name)
+
+    if table_exists(con, "telegram_messages") and msg_where:
         msg_ids = [r["id"] for r in con.execute(
-            "SELECT id FROM telegram_messages WHERE channel_id=?",
-            (channel_id,)
+            "SELECT id FROM telegram_messages WHERE " + " OR ".join(msg_where),
+            msg_params
         ).fetchall()]
 
     if msg_ids:
@@ -397,13 +442,64 @@ def clear_telegram_channel_data(con, channel_id):
             removed["ioc_links_removed"] = cur.rowcount if cur.rowcount is not None else 0
 
     if table_exists(con, "telegram_artifacts"):
-        cur = con.execute("DELETE FROM telegram_artifacts WHERE channel_id=?", (channel_id,))
-        removed["artifacts_removed"] = cur.rowcount if cur.rowcount is not None else 0
+        art_where, art_params = [], []
+        if channel_id:
+            art_where.append("channel_id=?")
+            art_params.append(channel_id)
+        if channel_name and column_exists(con, "telegram_artifacts", "channel_name"):
+            art_where.append("channel_name=?")
+            art_params.append(channel_name)
+        if art_where:
+            cur = con.execute("DELETE FROM telegram_artifacts WHERE " + " OR ".join(art_where), art_params)
+            removed["artifacts_removed"] = cur.rowcount if cur.rowcount is not None else 0
 
-    if table_exists(con, "telegram_messages"):
-        cur = con.execute("DELETE FROM telegram_messages WHERE channel_id=?", (channel_id,))
+    if table_exists(con, "telegram_messages") and msg_where:
+        cur = con.execute("DELETE FROM telegram_messages WHERE " + " OR ".join(msg_where), msg_params)
         removed["messages_removed"] = cur.rowcount if cur.rowcount is not None else 0
 
+    return removed
+
+
+def delete_telegram_message_data(con, msg_id):
+    """Delete one Telegram message and DB rows directly tied to it."""
+    try:
+        msg_id = int(msg_id or 0)
+    except Exception:
+        msg_id = 0
+    if not msg_id or not table_exists(con, "telegram_messages"):
+        return {"messages_removed": 0, "artifacts_removed": 0, "tags_removed": 0, "ioc_links_removed": 0}
+
+    row = con.execute(
+        "SELECT id, channel_id, channel_name, message_id FROM telegram_messages WHERE id=?",
+        (msg_id,)
+    ).fetchone()
+    if not row:
+        return {"messages_removed": 0, "artifacts_removed": 0, "tags_removed": 0, "ioc_links_removed": 0}
+
+    removed = {"messages_removed": 0, "artifacts_removed": 0, "tags_removed": 0, "ioc_links_removed": 0}
+
+    if table_exists(con, "msg_tags"):
+        cur = con.execute("DELETE FROM msg_tags WHERE msg_id=?", (msg_id,))
+        removed["tags_removed"] = cur.rowcount if cur.rowcount is not None else 0
+
+    if table_exists(con, "ioc_links"):
+        cur = con.execute("DELETE FROM ioc_links WHERE msg_id=?", (msg_id,))
+        removed["ioc_links_removed"] = cur.rowcount if cur.rowcount is not None else 0
+
+    if table_exists(con, "telegram_artifacts"):
+        art_where, art_params = [], []
+        if row["channel_id"] is not None and row["message_id"] is not None:
+            art_where.append("(channel_id=? AND message_id=?)")
+            art_params.extend([str(row["channel_id"]), int(row["message_id"])])
+        if row["channel_name"] and column_exists(con, "telegram_artifacts", "channel_name") and row["message_id"] is not None:
+            art_where.append("(channel_name=? AND message_id=?)")
+            art_params.extend([str(row["channel_name"]), int(row["message_id"])])
+        if art_where:
+            cur = con.execute("DELETE FROM telegram_artifacts WHERE " + " OR ".join(art_where), art_params)
+            removed["artifacts_removed"] = cur.rowcount if cur.rowcount is not None else 0
+
+    cur = con.execute("DELETE FROM telegram_messages WHERE id=?", (msg_id,))
+    removed["messages_removed"] = cur.rowcount if cur.rowcount is not None else 0
     return removed
 
 
@@ -480,8 +576,9 @@ def attach_telegram_intel(con, message_rows):
                 if len(iocs) < 8:
                     iocs.append({'value': r['value'], 'quality': r['quality']})
                 by_id[mid]['intel_ioc_count'] += 1
-    except Exception:
+    except Exception as e:
         # Never let enrichment display break the Telegram tab.
+        log.debug(f"attach_telegram_intel error: {e}", exc_info=True)
         return messages
 
     return messages
@@ -547,18 +644,245 @@ def get_telegram_artifact_row(artifact_id):
 
 
 def safe_artifact_path(local_path):
+    """Resolve Telegram artifact paths safely, including the external storage symlink."""
     if not local_path:
         return None
     try:
-        path = Path(local_path).expanduser().resolve()
-        base = BASE_DIR.resolve()
-        if path != base and base not in path.parents:
+        raw_path = Path(local_path).expanduser()
+        if not raw_path.is_absolute():
+            raw_path = BASE_DIR / raw_path
+
+        path = raw_path.resolve()
+
+        allowed_roots = [
+            (BASE_DIR / "telegram_artifacts").resolve(),
+            Path("/mnt/intel_storage/telegram_artifacts").resolve(),
+        ]
+
+        if not any(path == root or root in path.parents for root in allowed_roots):
             return None
+
         if not path.exists() or not path.is_file():
             return None
+
         return path
     except Exception:
         return None
+
+
+def ensure_telegram_credentials_tables(con):
+    """Create Telegram credential index tables. Safe to run repeatedly."""
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS telegram_credentials (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        artifact_id INTEGER NOT NULL,
+        channel_id TEXT,
+        channel_name TEXT,
+        message_id INTEGER,
+        filename TEXT,
+        sha256 TEXT,
+        line_no INTEGER,
+        email TEXT,
+        username TEXT,
+        password TEXT,
+        domain TEXT,
+        combo_type TEXT,
+        severity TEXT DEFAULT 'high',
+        indexed_at INTEGER,
+        UNIQUE(artifact_id, line_no)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tgcred_email ON telegram_credentials(email);
+    CREATE INDEX IF NOT EXISTS idx_tgcred_domain ON telegram_credentials(domain);
+    CREATE INDEX IF NOT EXISTS idx_tgcred_username ON telegram_credentials(username);
+    CREATE INDEX IF NOT EXISTS idx_tgcred_artifact ON telegram_credentials(artifact_id);
+
+    CREATE TABLE IF NOT EXISTS telegram_credential_index_state (
+        artifact_id INTEGER PRIMARY KEY,
+        sha256 TEXT,
+        size_bytes INTEGER,
+        status TEXT,
+        credentials_found INTEGER DEFAULT 0,
+        error TEXT,
+        indexed_at INTEGER
+    );
+    """)
+
+
+def is_credential_artifact(filename):
+    return Path(str(filename or "")).suffix.lower() in TEXT_CREDENTIAL_ARTIFACT_EXTS
+
+
+def is_corporate_email_domain(domain):
+    d = str(domain or "").strip().lower()
+    return bool(d and d not in CONSUMER_EMAIL_DOMAINS)
+
+
+def index_telegram_credential_artifact(con, artifact_row):
+    """Parse email:password style Telegram files into telegram_credentials."""
+    ensure_telegram_credentials_tables(con)
+
+    artifact_id = int(artifact_row["id"])
+    filename = artifact_row["filename"] or ""
+    size_bytes = int(artifact_row["size_bytes"] or 0)
+    now = int(time.time())
+
+    if not is_credential_artifact(filename):
+        con.execute("""
+            INSERT OR REPLACE INTO telegram_credential_index_state
+            (artifact_id, sha256, size_bytes, status, credentials_found, error, indexed_at)
+            VALUES (?, ?, ?, 'skipped_type', 0, NULL, ?)
+        """, (artifact_id, artifact_row["sha256"], size_bytes, now))
+        return 0
+
+    if size_bytes and size_bytes > MAX_TG_CREDENTIAL_INDEX_BYTES:
+        con.execute("""
+            INSERT OR REPLACE INTO telegram_credential_index_state
+            (artifact_id, sha256, size_bytes, status, credentials_found, error, indexed_at)
+            VALUES (?, ?, ?, 'skipped_large', 0, NULL, ?)
+        """, (artifact_id, artifact_row["sha256"], size_bytes, now))
+        return 0
+
+    path = safe_artifact_path(artifact_row["local_path"])
+    if not path:
+        con.execute("""
+            INSERT OR REPLACE INTO telegram_credential_index_state
+            (artifact_id, sha256, size_bytes, status, credentials_found, error, indexed_at)
+            VALUES (?, ?, ?, 'missing', 0, 'file missing or rejected by safe path', ?)
+        """, (artifact_id, artifact_row["sha256"], size_bytes, now))
+        return 0
+
+    con.execute("DELETE FROM telegram_credentials WHERE artifact_id=?", (artifact_id,))
+    found = 0
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line_no, line in enumerate(f, 1):
+                if line_no > MAX_TG_CREDENTIAL_INDEX_LINES:
+                    break
+
+                m = EMAIL_PASS_RE.match(line)
+                if not m:
+                    continue
+
+                email = m.group(1).strip().lower()
+                password = m.group(2).strip()
+                if not email or not password or len(password) < 3:
+                    continue
+
+                domain = email.split("@", 1)[1].lower()
+                username = email.split("@", 1)[0]
+
+                con.execute("""
+                    INSERT OR IGNORE INTO telegram_credentials
+                    (artifact_id, channel_id, channel_name, message_id, filename, sha256,
+                     line_no, email, username, password, domain, combo_type, severity, indexed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'email_pass', 'high', ?)
+                """, (
+                    artifact_id,
+                    artifact_row["channel_id"],
+                    artifact_row["channel_name"],
+                    artifact_row["message_id"],
+                    filename,
+                    artifact_row["sha256"],
+                    line_no,
+                    email,
+                    username,
+                    password,
+                    domain,
+                    now
+                ))
+                found += 1
+
+        con.execute("""
+            INSERT OR REPLACE INTO telegram_credential_index_state
+            (artifact_id, sha256, size_bytes, status, credentials_found, error, indexed_at)
+            VALUES (?, ?, ?, 'indexed', ?, NULL, ?)
+        """, (artifact_id, artifact_row["sha256"], size_bytes, found, now))
+        return found
+
+    except Exception as e:
+        con.execute("""
+            INSERT OR REPLACE INTO telegram_credential_index_state
+            (artifact_id, sha256, size_bytes, status, credentials_found, error, indexed_at)
+            VALUES (?, ?, ?, 'error', ?, ?, ?)
+        """, (artifact_id, artifact_row["sha256"], size_bytes, found, str(e)[:500], now))
+        return found
+
+
+def index_pending_telegram_credentials(con, limit=100):
+    """Index downloaded Telegram artifacts that have not been credential-indexed yet."""
+    ensure_telegram_credentials_tables(con)
+
+    rows = con.execute("""
+        SELECT ta.id, ta.channel_id, ta.channel_name, ta.message_id, ta.filename,
+               ta.mime_type, ta.size_bytes, ta.sha256, ta.local_path, ta.download_status
+        FROM telegram_artifacts ta
+        LEFT JOIN telegram_credential_index_state st ON st.artifact_id = ta.id
+        WHERE ta.download_status='downloaded'
+          AND ta.local_path IS NOT NULL
+          AND COALESCE(ta.size_bytes, 0) <= ?
+          AND (
+              st.artifact_id IS NULL
+              OR COALESCE(st.sha256, '') != COALESCE(ta.sha256, '')
+              OR COALESCE(st.size_bytes, -1) != COALESCE(ta.size_bytes, -1)
+          )
+        ORDER BY ta.id DESC
+        LIMIT ?
+    """, (MAX_TG_CREDENTIAL_INDEX_BYTES, int(limit))).fetchall()
+
+    files = 0
+    creds = 0
+    for row in rows:
+        files += 1
+        creds += index_telegram_credential_artifact(con, row)
+
+    return {"files_indexed": files, "credentials_indexed": creds}
+
+
+def search_telegram_credentials(con, term, max_results=50):
+    """Return credential exposure cards for Intel Search."""
+    ensure_telegram_credentials_tables(con)
+
+    q = str(term or "").strip().lower()
+    if len(q) < 3:
+        return []
+
+    q_domain = q[1:] if q.startswith("@") else q
+    params = []
+    where = []
+
+    if "@" in q:
+        where.append("email LIKE ?")
+        params.append(f"%{q}%")
+    elif "." in q_domain:
+        where.append("domain LIKE ?")
+        params.append(f"%{q_domain}%")
+    else:
+        where.append("(email LIKE ? OR username LIKE ? OR password LIKE ?)")
+        params.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
+
+    rows = con.execute(f"""
+        SELECT id, artifact_id, channel_id, channel_name, message_id,
+               filename, line_no, email, username, password, domain,
+               combo_type, severity
+        FROM telegram_credentials
+        WHERE {" OR ".join(where)}
+        ORDER BY id DESC
+        LIMIT ?
+    """, params + [int(max_results)]).fetchall()
+
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["title"] = "Credential exposure"
+        d["source"] = "Dark web credential leak"
+        d["found_in"] = "Telegram"
+        d["exposure_date"] = "Unknown"
+        d["data_types"] = ["corporate email" if is_corporate_email_domain(d.get("domain")) else "email", "plaintext password"]
+        d["corporate"] = is_corporate_email_domain(d.get("domain"))
+        out.append(d)
+    return out
+
 
 def ransomware_telegram_correlation(con, group_name):
     """Build read-only Telegram intel correlation for a ransomware group name.
@@ -886,19 +1210,20 @@ def start_leak_archive_worker(job_id):
 
 def ensure_indexes():
     con = db()
-    con.executescript("""
-        CREATE INDEX IF NOT EXISTS idx_sites_noise_trust ON sites(noise,trust_score DESC,score DESC);
-        CREATE INDEX IF NOT EXISTS idx_sites_host        ON sites(host);
-        CREATE INDEX IF NOT EXISTS idx_sites_host_noise  ON sites(host,noise);
-        CREATE INDEX IF NOT EXISTS idx_sites_category    ON sites(category,noise);
-        CREATE INDEX IF NOT EXISTS idx_sites_bookmarked  ON sites(bookmarked,noise);
-        CREATE INDEX IF NOT EXISTS idx_sites_timestamp   ON sites(timestamp DESC);
-        CREATE INDEX IF NOT EXISTS idx_leaks_conf        ON leaks(confidence DESC);
-        CREATE INDEX IF NOT EXISTS idx_leaks_ts          ON leaks(timestamp DESC);
-        CREATE INDEX IF NOT EXISTS idx_tgmsg_leak        ON telegram_messages(has_leak,confidence DESC);
-        CREATE INDEX IF NOT EXISTS idx_tgmsg_chan        ON telegram_messages(channel_id);
-        CREATE INDEX IF NOT EXISTS idx_tgchan_source     ON telegram_channels(source_tier);
-    """)
+    for stmt in [
+        "CREATE INDEX IF NOT EXISTS idx_sites_noise_trust ON sites(noise,trust_score DESC,score DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_sites_host        ON sites(host)",
+        "CREATE INDEX IF NOT EXISTS idx_sites_host_noise  ON sites(host,noise)",
+        "CREATE INDEX IF NOT EXISTS idx_sites_category    ON sites(category,noise)",
+        "CREATE INDEX IF NOT EXISTS idx_sites_bookmarked  ON sites(bookmarked,noise)",
+        "CREATE INDEX IF NOT EXISTS idx_sites_timestamp   ON sites(timestamp DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_leaks_conf        ON leaks(confidence DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_leaks_ts          ON leaks(timestamp DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_tgmsg_leak        ON telegram_messages(has_leak,confidence DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_tgmsg_chan        ON telegram_messages(channel_id)",
+        "CREATE INDEX IF NOT EXISTS idx_tgchan_source     ON telegram_channels(source_tier)",
+    ]:
+        con.execute(stmt)
     con.commit(); con.close()
 
 def ensure_db():
@@ -1020,14 +1345,17 @@ def ensure_db():
         blocked_at   INTEGER
     );
     CREATE TABLE IF NOT EXISTS telegram_messages (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        channel_id  TEXT,
-        channel_name TEXT,
-        message_id  INTEGER,
-        text        TEXT,
-        timestamp   INTEGER,
-        has_leak    INTEGER DEFAULT 0,
-        confidence  INTEGER DEFAULT 0,
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_id       TEXT,
+        channel_name     TEXT,
+        message_id       INTEGER,
+        text             TEXT,
+        timestamp        INTEGER,
+        has_leak         INTEGER DEFAULT 0,
+        confidence       INTEGER DEFAULT 0,
+        intel_processed  INTEGER DEFAULT 0,
+        is_duplicate     INTEGER DEFAULT 0,
+        msg_hash         TEXT,
         UNIQUE(channel_id, message_id)
     );
     CREATE INDEX IF NOT EXISTS idx_tgmsg_leak ON telegram_messages(has_leak,confidence DESC);
@@ -1084,6 +1412,7 @@ def ensure_db():
         con.execute("ALTER TABLE telegram_messages ADD COLUMN msg_hash TEXT")
 
     ensure_leak_archive_tables(con)
+    ensure_telegram_credentials_tables(con)
 
 def update_trust_scores():
     """Recalculate trust scores for all sites — runs after re-crawl updates."""
@@ -1283,7 +1612,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif p.path == "/api/leaks":
             q    = g("q"); sort=g("sort","confidence")
-            page = int(g("page","1")); per_page=50; offset=(page-1)*per_page
+            page = max(1, int(g("page","1") or 1))
+            per_page = int(g("per_page","50") or 50)
+            if per_page not in (50, 100, 200, 300):
+                per_page = 50
+            offset = (page-1)*per_page
             where, params = [], []
             if q:
                 where.append("id IN (SELECT rowid FROM leaks_fts WHERE leaks_fts MATCH ?)")
@@ -1311,7 +1644,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p.path == "/api/intel/search":
             term = g("term","").strip()
             if not term or len(term)<3:
-                self.send_json({"term":term,"total":0,"exposures":[],"leaks":[],"telegram":[]}); return
+                self.send_json({"term":term,"total":0,"exposures":[],"leaks":[],"telegram":[],"credential_exposures":[]}); return
             like = f"%{term}%"
             con = db()
             try:
@@ -1439,15 +1772,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         (like, like)
                     ).fetchall()]
 
+                credential_exposures = []
+                if table_exists(con, "telegram_artifacts"):
+                    try:
+                        index_pending_telegram_credentials(con, limit=25)
+                        con.commit()
+                    except Exception:
+                        con.rollback()
+                    credential_exposures = search_telegram_credentials(con, term)
+
                 self.send_json({
                     "term": term,
-                    "total": len(exposures) + len(leaks) + len(telegram),
+                    "total": len(exposures) + len(leaks) + len(telegram) + len(credential_exposures),
                     "exposures": exposures,
                     "leaks": leaks,
-                    "telegram": telegram
+                    "telegram": telegram,
+                    "credential_exposures": credential_exposures
                 })
             except Exception as e:
-                self.send_json({"term":term,"total":0,"exposures":[],"leaks":[],"telegram":[],"error":str(e)}, 500)
+                self.send_json({"term":term,"total":0,"exposures":[],"leaks":[],"telegram":[],"credential_exposures":[],"error":str(e)}, 500)
             finally:
                 con.close()
 
@@ -1707,6 +2050,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con.commit(); con.close()
             self.send_json({"ok":True,"removed":removed})
 
+        elif p.path == "/api/telegram_credentials/rebuild":
+            limit = int(g("limit", "500") or 500)
+            if limit < 1:
+                limit = 1
+            if limit > 5000:
+                limit = 5000
+
+            con = db()
+            try:
+                ensure_telegram_credentials_tables(con)
+                stats = index_pending_telegram_credentials(con, limit=limit)
+                con.commit()
+                totals = con.execute("""
+                    SELECT
+                        COUNT(*) AS artifacts_seen,
+                        SUM(CASE WHEN status='indexed' THEN 1 ELSE 0 END) AS indexed_files,
+                        SUM(CASE WHEN status='indexed' THEN credentials_found ELSE 0 END) AS credentials_indexed,
+                        SUM(CASE WHEN status LIKE 'skipped_%' THEN 1 ELSE 0 END) AS skipped_files,
+                        SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_files
+                    FROM telegram_credential_index_state
+                """).fetchone()
+                self.send_json({"ok": True, **stats, "totals": dict(totals)})
+            except Exception as e:
+                con.rollback()
+                self.send_json({"ok": False, "reason": str(e)}, 500)
+            finally:
+                con.close()
+
+        elif p.path == "/api/telegram_credentials/status":
+            con = db()
+            try:
+                ensure_telegram_credentials_tables(con)
+                totals = con.execute("""
+                    SELECT
+                        COUNT(*) AS artifacts_seen,
+                        SUM(CASE WHEN status='indexed' THEN 1 ELSE 0 END) AS indexed_files,
+                        SUM(CASE WHEN status='indexed' THEN credentials_found ELSE 0 END) AS credentials_indexed,
+                        SUM(CASE WHEN status LIKE 'skipped_%' THEN 1 ELSE 0 END) AS skipped_files,
+                        SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS error_files
+                    FROM telegram_credential_index_state
+                """).fetchone()
+                self.send_json({"ok": True, "totals": dict(totals)})
+            except Exception as e:
+                self.send_json({"ok": False, "reason": str(e)}, 500)
+            finally:
+                con.close()
+
         elif p.path == "/api/telegram_artifact/download":
             artifact_id = g("id", "").strip()
             if not artifact_id.isdigit():
@@ -1803,22 +2193,124 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con  = db()
             try:
                 if view == "channels":
-                    where, params = ["COALESCE(blocked,0)=0"], []
+                    # The channels table can contain multiple invite URLs for the
+                    # same Telegram channel_id, while messages contain the real
+                    # display name in telegram_messages.channel_name. Collapse rows
+                    # by channel_id/url and search both tables so a name visible in
+                    # Messages is also findable in Channels.
+                    where, params = ["COALESCE(c.blocked,0)=0"], []
                     if q:
-                        where.append("(url LIKE ? OR name LIKE ? OR channel_type LIKE ?)")
-                        params.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
+                        like_q = f"%{q}%"
+                        where.append("""(
+                            c.url LIKE ?
+                            OR c.name LIKE ?
+                            OR c.channel_type LIKE ?
+                            OR c.channel_id LIKE ?
+                            OR EXISTS (
+                                SELECT 1
+                                FROM telegram_messages tm_search
+                                WHERE tm_search.channel_id = c.channel_id
+                                  AND tm_search.channel_name LIKE ?
+                            )
+                        )""")
+                        params.extend([like_q, like_q, like_q, like_q, like_q])
                     if source_tier:
-                        where.append("COALESCE(source_tier,'unknown')=?")
+                        where.append("COALESCE(c.source_tier,'unknown')=?")
                         params.append(source_tier)
+
                     w = ("WHERE " + " AND ".join(where)) if where else ""
-                    rows = con.execute(
-                        f"SELECT * FROM telegram_channels {w} ORDER BY message_count DESC LIMIT 200", params
-                    ).fetchall()
-                    self.send_json({"channels":[dict(r) for r in rows]})
+                    total = con.execute(f"""
+                        SELECT COUNT(*)
+                        FROM (
+                            SELECT COALESCE(NULLIF(c.channel_id,''), c.url) AS group_key
+                            FROM telegram_channels c
+                            {w}
+                            GROUP BY COALESCE(NULLIF(c.channel_id,''), c.url)
+                        ) x
+                    """, params).fetchone()[0]
+                    rows = con.execute(f"""
+                        WITH channel_groups AS (
+                            SELECT
+                                COALESCE(NULLIF(c.channel_id,''), c.url) AS group_key,
+                                MIN(c.id) AS id,
+                                MAX(NULLIF(c.channel_id,'')) AS channel_id,
+                                MIN(c.url) AS url,
+                                MAX(NULLIF(c.name,'')) AS saved_name,
+                                MAX(COALESCE(c.channel_type,'cti')) AS channel_type,
+                                MAX(COALESCE(c.joined,0)) AS joined,
+                                MAX(COALESCE(c.active,0)) AS active,
+                                MAX(COALESCE(c.blocked,0)) AS blocked,
+                                MAX(COALESCE(c.source_tier,'unknown')) AS source_tier
+                            FROM telegram_channels c
+                            {w}
+                            GROUP BY COALESCE(NULLIF(c.channel_id,''), c.url)
+                        )
+                        SELECT
+                            cg.id,
+                            cg.url,
+                            COALESCE(
+                                NULLIF((
+                                    SELECT tm.channel_name
+                                    FROM telegram_messages tm
+                                    WHERE tm.channel_id = cg.channel_id
+                                      AND tm.channel_name IS NOT NULL
+                                      AND TRIM(tm.channel_name) != ''
+                                    GROUP BY tm.channel_name
+                                    ORDER BY COUNT(*) DESC, MAX(tm.timestamp) DESC
+                                    LIMIT 1
+                                ), ''),
+                                NULLIF(cg.saved_name, ''),
+                                NULLIF(cg.channel_id, ''),
+                                cg.url
+                            ) AS name,
+                            COALESCE(
+                                NULLIF((
+                                    SELECT tm.channel_name
+                                    FROM telegram_messages tm
+                                    WHERE tm.channel_id = cg.channel_id
+                                      AND tm.channel_name IS NOT NULL
+                                      AND TRIM(tm.channel_name) != ''
+                                    GROUP BY tm.channel_name
+                                    ORDER BY COUNT(*) DESC, MAX(tm.timestamp) DESC
+                                    LIMIT 1
+                                ), ''),
+                                NULLIF(cg.saved_name, ''),
+                                NULLIF(cg.channel_id, ''),
+                                cg.url
+                            ) AS display_name,
+                            cg.channel_id,
+                            cg.channel_type,
+                            cg.joined,
+                            cg.active,
+                            cg.blocked,
+                            cg.source_tier,
+                            CASE
+                                WHEN cg.url LIKE 'tg://channel/%' OR cg.url LIKE 'orphan://%' THEN 1
+                                ELSE 0
+                            END AS orphaned,
+                            (
+                                SELECT COUNT(*)
+                                FROM telegram_messages tm_count
+                                WHERE tm_count.channel_id = cg.channel_id
+                            ) AS message_count,
+                            (
+                                SELECT MAX(tm_last.timestamp)
+                                FROM telegram_messages tm_last
+                                WHERE tm_last.channel_id = cg.channel_id
+                            ) AS last_message
+                        FROM channel_groups cg
+                        ORDER BY message_count DESC, name
+                        LIMIT ? OFFSET ?
+                    """, params + [per_page, offset]).fetchall()
+                    self.send_json({"channels":[dict(r) for r in rows], "total": total, "page": page, "per_page": per_page})
                     return
 
-                muted_sub = "SELECT channel_id FROM telegram_channels WHERE (active=0 OR COALESCE(blocked,0)=1) AND channel_id IS NOT NULL"
-                where = [f"channel_id NOT IN ({muted_sub})"]
+                muted_sub = "SELECT channel_id FROM telegram_channels WHERE (active=0 OR COALESCE(blocked,0)=1) AND channel_id IS NOT NULL AND TRIM(channel_id) != ''"
+                muted_name_sub = "SELECT name FROM telegram_channels WHERE (active=0 OR COALESCE(blocked,0)=1) AND name IS NOT NULL AND TRIM(name) != ''"
+                where = [
+                    f"COALESCE(channel_id,'') NOT IN ({muted_sub})",
+                    f"COALESCE(channel_name,'') NOT IN ({muted_name_sub})"
+                ]
                 params = []
                 if view == "leaks":
                     where.append("has_leak=1")
@@ -1935,7 +2427,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 con.close()
                 self.send_json({"total_messages":total_msg,"leak_messages":leak_msg,
                                "joined_channels":channels,"discovered_channels":discovered})
-            except:
+            except Exception:
                 self.send_json({"total_messages":0,"leak_messages":0,"joined_channels":0,"discovered_channels":0})
 
         elif p.path == "/api/intel/dashboard":
@@ -2074,7 +2566,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 length  = int(self.headers.get("Content-Length", 0))
                 body    = self.rfile.read(length) if length else b"{}"
                 payload = json.loads(body)
-            except:
+            except Exception:
                 payload = {}
             con = db()
             try:
@@ -2132,7 +2624,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     (per, offset)).fetchall()
                 total = con.execute("SELECT COUNT(*) FROM canary_hits").fetchone()[0]
                 self.send_json({"hits":[dict(r) for r in rows],"total":total})
-            except:
+            except Exception:
                 self.send_json({"hits":[],"total":0})
             con.close()
 
@@ -2158,6 +2650,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             con.commit(); con.close()
             self.send_json({"ok":True})
 
+        elif p.path == "/api/telegram/message_delete":
+            msg_id = g("id", "").strip()
+            if not msg_id.isdigit():
+                self.send_json({"ok": False, "reason": "Missing message id"}, 400)
+                return
+            con = db()
+            try:
+                removed = delete_telegram_message_data(con, int(msg_id))
+                con.commit()
+                self.send_json({"ok": True, **removed})
+            except Exception as e:
+                con.rollback()
+                self.send_json({"ok": False, "reason": str(e)}, 500)
+            finally:
+                con.close()
+
         elif p.path == "/api/telegram/mute":
             url = g("url","").strip()
             mute = int(g("mute","1"))
@@ -2169,30 +2677,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json({"ok":True,"muted":bool(mute)})
 
         elif p.path == "/api/telegram/clear":
-            url = normalize_telegram_url(g("url","").strip())
-            if not url:
-                self.send_json({"ok": False, "reason": "Missing channel URL"}, 400)
+            raw_url = g("url","").strip()
+            url = normalize_telegram_url(raw_url)
+            channel_id = g("channel_id", "").strip()
+            channel_name = g("channel_name", "").strip()
+            if not url and not channel_id and not channel_name:
+                self.send_json({"ok": False, "reason": "Missing channel identifier"}, 400)
                 return
 
             con = db()
             try:
-                row = con.execute(
-                    "SELECT id,url,name,channel_id FROM telegram_channels WHERE url=?",
-                    (url,)
-                ).fetchone()
+                row = None
+                lookup_parts, lookup_params = [], []
+                if url:
+                    lookup_parts.append("url=?")
+                    lookup_params.append(url)
+                if channel_id:
+                    lookup_parts.append("channel_id=?")
+                    lookup_params.append(channel_id)
+                if channel_name:
+                    lookup_parts.append("name=?")
+                    lookup_params.append(channel_name)
+                if lookup_parts:
+                    row = con.execute(
+                        "SELECT id,url,name,channel_id FROM telegram_channels WHERE " + " OR ".join(lookup_parts) + " LIMIT 1",
+                        lookup_params
+                    ).fetchone()
 
-                if not row:
-                    self.send_json({"ok": False, "reason": "Channel not found"}, 404)
-                    return
+                if row:
+                    channel_id = channel_id or row["channel_id"]
+                    channel_name = channel_name or row["name"]
 
-                removed = clear_telegram_channel_data(con, row["channel_id"])
-                con.execute("""
-                    UPDATE telegram_channels
-                    SET active=0,
-                        message_count=0,
-                        last_message=NULL
-                    WHERE url=?
-                """, (url,))
+                removed = clear_telegram_channel_data(con, channel_id, channel_name)
+
+                if row:
+                    if channel_id:
+                        con.execute("""
+                            UPDATE telegram_channels
+                            SET active=0,
+                                message_count=0,
+                                last_message=NULL
+                            WHERE channel_id=?
+                        """, (channel_id,))
+                    else:
+                        con.execute("""
+                            UPDATE telegram_channels
+                            SET active=0,
+                                message_count=0,
+                                last_message=NULL
+                            WHERE id=?
+                        """, (row["id"],))
+
                 con.commit()
                 self.send_json({"ok": True, **removed})
             except Exception as e:
@@ -2202,27 +2737,93 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 con.close()
 
         elif p.path == "/api/telegram/delete":
-            url = normalize_telegram_url(g("url","").strip())
-            if not url:
-                self.send_json({"ok": False, "reason": "Missing channel URL"}, 400)
+            raw_url = g("url","").strip()
+            url = normalize_telegram_url(raw_url)
+            channel_id = g("channel_id", "").strip()
+            channel_name = g("channel_name", "").strip()
+            if not url and not channel_id and not channel_name:
+                self.send_json({"ok": False, "reason": "Missing channel identifier"}, 400)
                 return
 
             con = db()
             try:
-                row = con.execute(
-                    "SELECT id,url,name,channel_id FROM telegram_channels WHERE url=?",
-                    (url,)
-                ).fetchone()
+                row = None
+                lookup_parts, lookup_params = [], []
+                if url:
+                    lookup_parts.append("url=?")
+                    lookup_params.append(url)
+                if channel_id:
+                    lookup_parts.append("channel_id=?")
+                    lookup_params.append(channel_id)
+                if channel_name:
+                    lookup_parts.append("name=?")
+                    lookup_params.append(channel_name)
+                if lookup_parts:
+                    row = con.execute(
+                        "SELECT id,url,name,channel_id FROM telegram_channels WHERE " + " OR ".join(lookup_parts) + " LIMIT 1",
+                        lookup_params
+                    ).fetchone()
 
-                if not row:
-                    self.send_json({"ok": False, "reason": "Channel not found"}, 404)
-                    return
+                if row:
+                    channel_id = channel_id or row["channel_id"]
+                    channel_name = channel_name or row["name"]
 
-                channel_id = row["channel_id"]
-                removed = clear_telegram_channel_data(con, channel_id)
+                removed = clear_telegram_channel_data(con, channel_id, channel_name)
 
-                # Keep the channel row as a permanent block marker.
-                # This prevents INSERT OR IGNORE discovery from adding it back later.
+                # Keep or create a blocked marker so discovery/message filters can hide it later.
+                now = int(time.time())
+                if row:
+                    if channel_id:
+                        con.execute("""
+                            UPDATE telegram_channels
+                            SET active=0,
+                                joined=0,
+                                blocked=1,
+                                blocked_at=?,
+                                message_count=0,
+                                last_message=NULL,
+                                name=COALESCE(NULLIF(name,''), ?),
+                                channel_id=COALESCE(NULLIF(channel_id,''), ?)
+                            WHERE channel_id=?
+                        """, (now, channel_name, channel_id, channel_id))
+                    else:
+                        con.execute("""
+                            UPDATE telegram_channels
+                            SET active=0,
+                                joined=0,
+                                blocked=1,
+                                blocked_at=?,
+                                message_count=0,
+                                last_message=NULL,
+                                name=COALESCE(NULLIF(name,''), ?),
+                                channel_id=COALESCE(NULLIF(channel_id,''), ?)
+                            WHERE id=?
+                        """, (now, channel_name, channel_id, row["id"]))
+                else:
+                    marker = url or ("orphan://" + (channel_id or re.sub(r"[^A-Za-z0-9_.-]+", "_", channel_name)[:80]))
+                    con.execute("""
+                        INSERT OR IGNORE INTO telegram_channels
+                        (url, name, channel_id, channel_type, joined, active, message_count, blocked, blocked_at)
+                        VALUES (?, ?, ?, 'orphaned', 0, 0, 0, 1, ?)
+                    """, (marker, channel_name, channel_id, now))
+                    con.execute("""
+                        UPDATE telegram_channels
+                        SET active=0,
+                            joined=0,
+                            blocked=1,
+                            blocked_at=?,
+                            message_count=0,
+                            last_message=NULL
+                        WHERE url=?
+                    """, (now, marker))
+
+                # Defensive blocked marker: message-tab deletes may only have name/channel_id.
+                marker = url or ("orphan://" + (channel_id or re.sub(r"[^A-Za-z0-9_.-]+", "_", channel_name)[:80]))
+                con.execute("""
+                    INSERT OR IGNORE INTO telegram_channels
+                    (url, name, channel_id, channel_type, joined, active, message_count, blocked, blocked_at)
+                    VALUES (?, ?, ?, 'orphaned', 0, 0, 0, 1, ?)
+                """, (marker, channel_name, channel_id, now))
                 con.execute("""
                     UPDATE telegram_channels
                     SET active=0,
@@ -2230,9 +2831,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         blocked=1,
                         blocked_at=?,
                         message_count=0,
-                        last_message=NULL
+                        last_message=NULL,
+                        name=COALESCE(NULLIF(name,''), ?),
+                        channel_id=COALESCE(NULLIF(channel_id,''), ?)
                     WHERE url=?
-                """, (int(time.time()), url))
+                       OR (? != '' AND channel_id=?)
+                       OR (? != '' AND name=?)
+                """, (now, channel_name, channel_id, marker, channel_id, channel_id, channel_name, channel_name))
 
                 con.commit()
                 self.send_json({"ok": True, "blocked": True, **removed})
@@ -2257,43 +2862,61 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif p.path == "/api/ransomware/groups":
             import http.client as _hc, ssl as _ssl
-            try:
-                _key = os.environ.get("RANSOMWARE_LIVE_API_KEY", RANSOMWARE_LIVE_API_KEY).strip()
-                _ctx = _ssl.create_default_context()
+            global _rw_groups_cache, _rw_groups_cache_ts
+            force = g("force", "") == "1"
+            now   = time.time()
 
-                # Use the public endpoint unless an API key is configured.
-                # If the pro endpoint rejects/changes shape, fall back to public.
-                hosts_to_try = []
-                if _key:
-                    hosts_to_try.append(("api-pro.ransomware.live", {"accept":"application/json","X-Api-Key":_key}))
-                hosts_to_try.append(("api.ransomware.live", {"accept":"application/json"}))
-
-                last_status, last_body = 502, b'{"error":"ransomware.live request failed"}'
-                for _host, _headers in hosts_to_try:
-                    _conn = _hc.HTTPSConnection(_host, timeout=20, context=_ctx)
-                    _conn.request("GET", "/groups", headers=_headers)
-                    _resp = _conn.getresponse()
-                    _body = _resp.read()
-                    _conn.close()
-                    last_status, last_body = _resp.status, _body
-
-                    # Only accept a real JSON array or an object containing groups/data/results.
-                    if 200 <= _resp.status < 300:
-                        try:
-                            _parsed = json.loads(_body.decode("utf-8", errors="replace"))
-                            if isinstance(_parsed, list) or (isinstance(_parsed, dict) and any(k in _parsed for k in ("groups", "data", "results"))):
-                                self.send_json(_parsed)
-                                return
-                        except Exception:
-                            pass
-
+            # Serve cache if fresh and not forced
+            if not force and _rw_groups_cache is not None and (now - _rw_groups_cache_ts) < _RW_GROUPS_CACHE_TTL:
+                self.send_json(_rw_groups_cache)
+            else:
                 try:
-                    _msg = json.loads(last_body.decode("utf-8", errors="replace"))
-                except Exception:
-                    _msg = last_body.decode("utf-8", errors="replace")[:500]
-                self.send_json({"error": "ransomware.live /groups did not return a valid groups list", "status": last_status, "details": _msg}, 502)
-            except Exception as e:
-                self.send_json({"error": str(e)}, 502)
+                    _key = os.environ.get("RANSOMWARE_LIVE_API_KEY", RANSOMWARE_LIVE_API_KEY).strip()
+                    _ctx = _ssl.create_default_context()
+
+                    # Use the public endpoint unless an API key is configured.
+                    # If the pro endpoint rejects/changes shape, fall back to public.
+                    hosts_to_try = []
+                    if _key:
+                        hosts_to_try.append(("api-pro.ransomware.live", {"accept":"application/json","X-Api-Key":_key}))
+                    hosts_to_try.append(("api.ransomware.live", {"accept":"application/json"}))
+
+                    last_status, last_body = 502, b'{"error":"ransomware.live request failed"}'
+                    for _host, _headers in hosts_to_try:
+                        _conn = _hc.HTTPSConnection(_host, timeout=20, context=_ctx)
+                        _conn.request("GET", "/groups", headers=_headers)
+                        _resp = _conn.getresponse()
+                        _body = _resp.read()
+                        _conn.close()
+                        last_status, last_body = _resp.status, _body
+
+                        # Only accept a real JSON array or an object containing groups/data/results.
+                        if 200 <= _resp.status < 300:
+                            try:
+                                _parsed = json.loads(_body.decode("utf-8", errors="replace"))
+                                if isinstance(_parsed, list) or (isinstance(_parsed, dict) and any(k in _parsed for k in ("groups", "data", "results"))):
+                                    _rw_groups_cache    = _parsed
+                                    _rw_groups_cache_ts = time.time()
+                                    self.send_json(_parsed)
+                                    return
+                            except Exception:
+                                pass
+
+                    # Upstream failed — serve stale cache if available
+                    if _rw_groups_cache is not None:
+                        self.send_json(_rw_groups_cache)
+                    else:
+                        try:
+                            _msg = json.loads(last_body.decode("utf-8", errors="replace"))
+                        except Exception:
+                            _msg = last_body.decode("utf-8", errors="replace")[:500]
+                        self.send_json({"error": "ransomware.live /groups did not return a valid groups list", "status": last_status, "details": _msg}, 502)
+                except Exception as e:
+                    # Upstream exception — serve stale cache if available
+                    if _rw_groups_cache is not None:
+                        self.send_json(_rw_groups_cache)
+                    else:
+                        self.send_json({"error": str(e)}, 502)
 
         elif p.path == "/api/ransomware/correlation":
             name = g("name","").strip()
@@ -3849,7 +4472,7 @@ body::after {
           <div class="stat-pill"><span>Discovered</span><span class="val" id="tgDiscovered" style="color:var(--amber);">—</span></div>
         </div>
         <div class="search-bar" style="margin-left:8px;">
-          <input type="text" id="tgQ" placeholder="Search messages…" oninput="loadTelegram()">
+          <input type="text" id="tgQ" placeholder="Search messages…" oninput="tgPage=1;loadTelegram()">
         </div>
         <div class="result-count"><span id="tgShown">—</span> / <span id="tgTotal">—</span></div>
       </div>
@@ -4102,15 +4725,9 @@ body::after {
       <div id="bmPgEl"></div>
     </div>
 
-    <!-- Activity log -->
-    <div class="activity-bar">
-      <div class="activity-header">
-        <span class="activity-label">Activity Log</span>
-        <span class="activity-live" id="liveInd">● Live</span>
-        <button class="activity-clear" onclick="document.getElementById('log').innerHTML=''">clear</button>
-      </div>
-      <div id="log"></div>
-    </div>
+    <!-- Activity log removed from UI; hidden elements kept so existing JS does not break. -->
+    <span id="liveInd" style="display:none"></span>
+    <div id="log" style="display:none"></div>
 
       <!-- CANARIES -->
       <div class="panel" id="canariesPanel">
@@ -4700,14 +5317,55 @@ async function searchPersonal(){
       <span style="color:var(--text-3);margin-left:8px;font-family:JetBrains Mono,monospace;font-size:11px;">${esc(r.url||'')}</span>
       <span style="color:var(--amber);margin-left:8px;">${r.confidence||0}%</span>
     </div>`).join('');
+  const credentialRows=(res.credential_exposures||[]).slice(0,20).map((c,i)=>{
+    const pwId = `tgcred_pw_${i}_${Math.random().toString(16).slice(2)}`;
+    const isCorp = !!c.corporate;
+    const warning = isCorp
+      ? 'Corporate credential exposed — escalate to IT security team.'
+      : 'Change this password immediately, especially if reused on other services.';
+    return `<div style="margin-top:10px;padding:14px 16px;border:1px solid rgba(239,68,68,.35);border-left:3px solid var(--red);border-radius:10px;background:rgba(239,68,68,.035);max-width:760px;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <div style="font-weight:600;color:var(--text);">⚠ Credential exposure</div>
+        <div class="sev sev-high">High severity</div>
+      </div>
+      <div style="display:grid;grid-template-columns:150px 1fr;gap:7px 12px;font-size:13px;line-height:1.5;">
+        <div style="color:var(--text-3);">Email address</div>
+        <div style="color:var(--text);font-family:JetBrains Mono,monospace;">${esc(c.email||'')}</div>
+
+        <div style="color:var(--text-3);">Password exposed</div>
+        <div>
+          <span id="${pwId}" style="color:var(--text);font-family:JetBrains Mono,monospace;">••••••••</span>
+          <button class="row-btn" style="margin-left:8px;" onclick="document.getElementById('${pwId}').textContent='${jsEsc(c.password||'')}'">Reveal</button>
+        </div>
+
+        <div style="color:var(--text-3);">Data type</div>
+        <div>
+          ${(c.data_types||['email','plaintext password']).map(x=>`<span class="chip chip-red">${esc(x)}</span>`).join('')}
+        </div>
+
+        <div style="color:var(--text-3);">Exposure date</div>
+        <div style="color:var(--text);">Unknown</div>
+
+        <div style="color:var(--text-3);">Source</div>
+        <div style="color:var(--text);">Dark web credential leak</div>
+
+        <div style="color:var(--text-3);">Found in</div>
+        <div style="color:var(--accent-hi);">Telegram</div>
+      </div>
+      <div style="margin-top:12px;padding:9px 10px;border-radius:7px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);color:var(--amber);font-size:12px;">
+        ⓘ ${esc(warning)}
+      </div>
+    </div>`;
+  }).join('');
   const tgRows=(res.telegram||[]).slice(0,10).map(r=>`<div style="margin-top:4px;padding:4px 8px;border-left:2px solid var(--accent);">
       <span style="color:var(--accent-hi)">Telegram: ${esc(r.channel_name||'unknown')}</span>
       <span style="color:var(--text-2);margin-left:8px;">${esc((r.text||'').substring(0,160))}</span>
     </div>`).join('');
   el.innerHTML=`<span style="color:var(--red)">⚠ Found ${res.total.toLocaleString()} match(es)</span>`+
+    (credentialRows?`<div style="margin-top:8px;color:var(--text-3);font-size:11px;">Credential exposures</div>${credentialRows}`:'')+
     (exposureRows?`<div style="margin-top:6px;color:var(--text-3);font-size:11px;">Imported dump entities</div>${exposureRows}`:'')+
     (leakRows?`<div style="margin-top:6px;color:var(--text-3);font-size:11px;">Leak pages</div>${leakRows}`:'')+
-    (tgRows?`<div style="margin-top:6px;color:var(--text-3);font-size:11px;">Telegram</div>${tgRows}`:'');
+    (tgRows?`<div style="margin-top:6px;color:var(--text-3);font-size:11px;">Telegram messages</div>${tgRows}`:'');
 }
 
 
@@ -5202,6 +5860,7 @@ async function stopCrawl(){
 
 function addLog(msg,type=''){
   const el=document.getElementById('log');
+  if(!el) return;
   const d=document.createElement('div');
   d.className='ll '+type;
   d.textContent=ts()+msg;
@@ -5627,7 +6286,7 @@ async function loadPastes(){
 function goPastePage(p){const pages=Math.ceil(pasteTotal/50);if(p<1||p>pages)return;pastePage=p;loadPastes();}
 
 // ── Telegram tab ──────────────────────────────────────────────────────────────
-let tgView='leaks', tgPage=1, tgTotal=0;
+let tgView='leaks', tgPage=1, tgTotal=0, tgChannelPageSize=100;
 
 function setTgTab(v){
   tgView=v; tgPage=1;
@@ -5657,13 +6316,25 @@ async function muteChannel(url, btn){
   } catch(e){ toast("Disable failed","error"); }
 }
 
-async function clearTelegramChannel(url, name){
-  if(!url){ toast("No URL for channel","error"); return; }
-  const label = name || url;
-  const ok = confirm(`Clear DB data for this Telegram channel?\n\n${label}\n\nThis deletes stored messages/artifact rows and disables the channel, but does NOT block future rediscovery.`);
+function telegramChannelParams(url, channelId, channelName){
+  const params = new URLSearchParams();
+  if(url) params.set('url', url);
+  if(channelId) params.set('channel_id', channelId);
+  if(channelName) params.set('channel_name', channelName);
+  return params.toString();
+}
+
+async function clearTelegramChannel(url, name, channelId){
+  if(!url && !channelId && !name){ toast("No channel identifier","error"); return; }
+  const label = name || url || channelId;
+  const ok = confirm(`Clear DB data for this Telegram channel?
+
+${label}
+
+This deletes stored messages/artifact rows and disables saved channels, but does NOT block future rediscovery.`);
   if(!ok) return;
 
-  const res = await fetch('/api/telegram/clear?url=' + encodeURIComponent(url))
+  const res = await fetch('/api/telegram/clear?' + telegramChannelParams(url, channelId, name))
     .then(r=>r.json()).catch(e=>({ok:false, reason:String(e)}));
 
   if(res && res.ok){
@@ -5675,13 +6346,17 @@ async function clearTelegramChannel(url, name){
   }
 }
 
-async function deleteTelegramChannel(url, name){
-  if(!url){ toast("No URL for channel","error"); return; }
-  const label = name || url;
-  const ok = confirm(`Delete and block this Telegram channel?\n\n${label}\n\nThis clears its messages/artifact rows from the DB and prevents it from being re-added by discovery.`);
+async function deleteTelegramChannel(url, name, channelId){
+  if(!url && !channelId && !name){ toast("No channel identifier","error"); return; }
+  const label = name || url || channelId;
+  const ok = confirm(`Delete and block this Telegram channel?
+
+${label}
+
+This clears its messages/artifact rows from the DB and prevents it from being re-added by discovery when the channel ID is known.`);
   if(!ok) return;
 
-  const res = await fetch('/api/telegram/delete?url=' + encodeURIComponent(url))
+  const res = await fetch('/api/telegram/delete?' + telegramChannelParams(url, channelId, name))
     .then(r=>r.json()).catch(e=>({ok:false, reason:String(e)}));
 
   if(res && res.ok){
@@ -5691,6 +6366,33 @@ async function deleteTelegramChannel(url, name){
   } else {
     toast((res && res.reason) || 'Delete failed', 'error', 5000);
   }
+}
+
+async function deleteTelegramMessage(messageId){
+  if(!messageId){ toast('No message id','error'); return; }
+  const ok = confirm('Hide/delete this one Telegram message from the DB?');
+  if(!ok) return;
+  const res = await fetch('/api/telegram/message_delete?id=' + encodeURIComponent(messageId))
+    .then(r=>r.json()).catch(e=>({ok:false, reason:String(e)}));
+  if(res && res.ok){
+    toast('Message removed', 'success');
+    loadTelegramStats();
+    loadTelegram();
+  } else {
+    toast((res && res.reason) || 'Message delete failed', 'error', 5000);
+  }
+}
+
+function tgMessageActions(m){
+  const name = m.channel_name || '';
+  const channelId = m.channel_id || '';
+  const label = esc(name || channelId || 'unknown');
+  return `<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+    <span style="font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:.06em;">Actions</span>
+    <button class="row-btn" onclick="event.stopPropagation();deleteTelegramMessage(${Number(m.id)||0})" title="Remove only this message from the DB">Hide message</button>
+    <button class="row-btn" data-name="${esc(name)}" data-channel-id="${esc(channelId)}" onclick="event.stopPropagation();clearTelegramChannel('',this.getAttribute('data-name'),this.getAttribute('data-channel-id'))" title="Clear stored rows for ${label} and disable it" style="border-color:var(--amber);color:var(--amber);">Clear channel</button>
+    <button class="row-btn" data-name="${esc(name)}" data-channel-id="${esc(channelId)}" onclick="event.stopPropagation();deleteTelegramChannel('',this.getAttribute('data-name'),this.getAttribute('data-channel-id'))" title="Delete/block ${label}" style="border-color:var(--red);color:var(--red);">Delete + block</button>
+  </div>`;
 }
 
 function toggleTgMsg(id){
@@ -5804,6 +6506,7 @@ async function updateChannelSourceTier(sel){
 function tgFilterParams(){
   const get = id => (document.getElementById(id)||{}).value || '';
   const params = new URLSearchParams({view:tgView, q:(document.getElementById('tgQ')||{}).value||'', page:String(tgPage)});
+  if(tgView === 'channels') params.set('per_page', String(tgChannelPageSize || 100));
   const fields = {actor:get('tgActor'), threat:get('tgThreat'), ttp:get('tgTtp'), ioc_type:get('tgIoc'), source_tier:get('tgSourceTier'), min_conf:get('tgMinConf'), days:get('tgDays')};
   Object.entries(fields).forEach(([k,v])=>{ if(v) params.set(k,v); });
   const hd = document.getElementById('tgHideDupes');
@@ -5846,31 +6549,51 @@ async function loadTelegram(){
   const wrap = document.getElementById('tgTableWrap');
   const pgEl = document.getElementById('tgPgEl');
 
+  // Reset scroll to top when changing Telegram pages/views
+  requestAnimationFrame(() => {
+    const panel = document.getElementById('telegramPanel');
+    if (panel) panel.scrollTop = 0;
+
+    const scrollWrap = document.querySelector('#telegramPanel .panel-scroll');
+    if (scrollWrap) scrollWrap.scrollTop = 0;
+
+    window.scrollTo(0, 0);
+  });
+
   if(tgView === 'channels'){
     const channels = res.channels || [];
+    tgTotal = res.total || channels.length;
     document.getElementById('tgShown').textContent = channels.length;
-    document.getElementById('tgTotal').textContent = channels.length;
+    document.getElementById('tgTotal').textContent = tgTotal.toLocaleString();
     if(!channels.length){
-      wrap.innerHTML='<div class="empty"><div class="empty-icon">📡</div>No channels yet. Run telegram_monitor.py to start monitoring.</div>';
-      pgEl.innerHTML=''; return;
+      wrap.innerHTML='<div class="empty"><div class="empty-icon">📡</div>No channels found.</div>';
+      pgEl.innerHTML = renderTelegramChannelPagination(); return;
     }
-    const rows = channels.map(c=>`<tr>
-      <td class="td-url"><a href="${esc(c.url||'')}" target="_blank">${esc(c.url||'')}</a></td>
-      <td style="font-size:.75rem;color:#f0f6ff;">${esc(c.name||'')}</td>
-      <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:var(--dim);">${esc(c.channel_type||'')}</td>
-      <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:${c.joined?'var(--accent)':'var(--dim)'};">${c.joined?'joined':'pending'}</td>
-      <td>${sourceTierSelect(c)}</td>
-      <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:var(--accent2);">${(c.message_count||0).toLocaleString()}</td>
-      <td style="white-space:nowrap;min-width:210px;">
-        <div style="display:flex;gap:6px;align-items:center;flex-wrap:nowrap;">
-          <button class="row-btn" data-url="${esc(c.url||'')}" data-active="${c.active?1:0}" onclick="event.stopPropagation();muteChannel(this.getAttribute('data-url'),this)" title="Disable/Enable channel" style="${!c.active?'border-color:var(--red);color:var(--red);':''}">${c.active?'Disable':'Enable'}</button>
-          <button class="row-btn" data-url="${esc(c.url||'')}" data-name="${esc(c.name||'')}" onclick="event.stopPropagation();clearTelegramChannel(this.getAttribute('data-url'),this.getAttribute('data-name'))" title="Clear stored messages/artifacts and disable channel" style="border-color:var(--amber);color:var(--amber);">Clear</button>
-          <button class="row-btn" data-url="${esc(c.url||'')}" data-name="${esc(c.name||'')}" onclick="event.stopPropagation();deleteTelegramChannel(this.getAttribute('data-url'),this.getAttribute('data-name'))" title="Delete channel, clear DB data, and block rediscovery" style="border-color:var(--red);color:var(--red);">Delete</button>
-        </div>
-      </td>
-    </tr>`).join('');
+    const rows = channels.map(c=>{
+      const displayName = c.display_name || c.name || c.channel_name || c.channel_id || c.url || '';
+      const urlHtml = c.url ? `<a href="${esc(c.url)}" target="_blank">${esc(c.url)}</a>` : '<span style="color:var(--text-3);">message-only</span>';
+      const status = c.orphaned ? 'orphaned' : (c.joined ? 'joined' : 'pending');
+      const statusColor = c.orphaned ? 'var(--amber)' : (c.joined ? 'var(--accent)' : 'var(--dim)');
+      const tierCell = c.orphaned ? sourceTierBadge('unknown') : sourceTierSelect(c);
+      const muteBtn = c.url ? `<button class="row-btn" data-url="${esc(c.url||'')}" data-active="${c.active?1:0}" onclick="event.stopPropagation();muteChannel(this.getAttribute('data-url'),this)" title="Disable/Enable channel" style="${!c.active?'border-color:var(--red);color:var(--red);':''}">${c.active?'Disable':'Enable'}</button>` : '';
+      return `<tr>
+        <td class="td-url">${urlHtml}<div style="font-family:JetBrains Mono,monospace;font-size:10px;color:var(--text-3);margin-top:3px;">${esc(c.channel_id||'')}</div></td>
+        <td style="font-size:.75rem;color:#f0f6ff;">${esc(displayName)}</td>
+        <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:var(--dim);">${esc(c.channel_type||'')}</td>
+        <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:${statusColor};">${status}</td>
+        <td>${tierCell}</td>
+        <td style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:var(--accent2);">${(c.message_count||0).toLocaleString()}</td>
+        <td style="white-space:nowrap;min-width:210px;">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:nowrap;">
+            ${muteBtn}
+            <button class="row-btn" data-url="${esc(c.url||'')}" data-name="${esc(displayName)}" data-channel-id="${esc(c.channel_id||'')}" onclick="event.stopPropagation();clearTelegramChannel(this.getAttribute('data-url'),this.getAttribute('data-name'),this.getAttribute('data-channel-id'))" title="Clear stored messages/artifacts and disable channel" style="border-color:var(--amber);color:var(--amber);">Clear</button>
+            <button class="row-btn" data-url="${esc(c.url||'')}" data-name="${esc(displayName)}" data-channel-id="${esc(c.channel_id||'')}" onclick="event.stopPropagation();deleteTelegramChannel(this.getAttribute('data-url'),this.getAttribute('data-name'),this.getAttribute('data-channel-id'))" title="Delete channel, clear DB data, and block rediscovery" style="border-color:var(--red);color:var(--red);">Delete</button>
+          </div>
+        </td>
+      </tr>`;
+    }).join('');
     wrap.innerHTML=`<table class="data-table"><thead><tr><th>URL</th><th>Name</th><th>Type</th><th>Status</th><th>Source Tier</th><th>Messages</th><th style="min-width:210px;">Actions</th></tr></thead><tbody>${rows}</tbody></table>`;
-    pgEl.innerHTML='';
+    pgEl.innerHTML = renderTelegramChannelPagination();
     return;
   }
 
@@ -5904,6 +6627,7 @@ async function loadTelegram(){
          ${tgIntelBadges(m)}
          ${tgIntelDetails(m)}
          ${tgArtifactsHtml(m)}
+         ${tgMessageActions(m)}
        </td>
       <td style="padding-top:14px;white-space:nowrap;">
         ${m.has_leak?`<span class="sev ${sevClass}">${m.confidence}%</span>`:'<span style="color:var(--text-3);font-size:12px;">—</span>'}
@@ -5924,6 +6648,33 @@ async function loadTelegram(){
 }
 
 async function goTgPage(p){const pages=Math.ceil(tgTotal/50);if(p<1||p>pages)return;tgPage=p;loadTelegram();}
+
+function renderTelegramChannelPagination(){
+  const per = tgChannelPageSize || 100;
+  const pages = Math.max(1, Math.ceil((tgTotal || 0) / per));
+  const start = tgTotal ? ((tgPage - 1) * per) + 1 : 0;
+  const end = Math.min(tgPage * per, tgTotal || 0);
+  let b = `<span class="pg-info">Rows</span>
+    <select class="select" style="height:30px;padding:4px 8px;font-size:11px;" onchange="tgChannelPageSize=parseInt(this.value,10)||100;tgPage=1;loadTelegram()">
+      <option value="100" ${per===100?'selected':''}>100</option>
+      <option value="200" ${per===200?'selected':''}>200</option>
+      <option value="300" ${per===300?'selected':''}>300</option>
+    </select>
+    <span class="pg-info">${start.toLocaleString()}-${end.toLocaleString()} of ${(tgTotal||0).toLocaleString()}</span>`;
+  b += `<button class="pg" onclick="goTgChannelPage(${tgPage-1})" ${tgPage===1?'disabled':''}>prev</button>`;
+  for(let i=Math.max(1,tgPage-2); i<=Math.min(pages,tgPage+2); i++){
+    b += `<button class="pg ${i===tgPage?'active':''}" onclick="goTgChannelPage(${i})">${i}</button>`;
+  }
+  b += `<button class="pg" onclick="goTgChannelPage(${tgPage+1})" ${tgPage===pages?'disabled':''}>next</button>`;
+  return `<div class="pagination">${b}</div>`;
+}
+
+function goTgChannelPage(p){
+  const pages = Math.max(1, Math.ceil((tgTotal || 0) / (tgChannelPageSize || 100)));
+  if(p < 1 || p > pages) return;
+  tgPage = p;
+  loadTelegram();
+}
 
 // ── Intel Dashboard ───────────────────────────────────────────────────────────
 let _intelDashData = null;
@@ -6625,7 +7376,7 @@ if __name__ == "__main__":
     print("  ----------------------------")
     print("  http://localhost:" + str(PORT))
     print("  Ctrl+C to stop.\n")
-    with socketserver.TCPServer(("0.0.0.0", PORT), Handler) as httpd:
+    with socketserver.ThreadingTCPServer(("0.0.0.0", PORT), Handler) as httpd:
         httpd.allow_reuse_address = True
         try: httpd.serve_forever()
         except KeyboardInterrupt:
